@@ -73,6 +73,11 @@ statemachine class r_MultiplayerClient
     private var inGame : bool;
     private var spawnTime : float;
     private var serverReceived : bool;
+    private var lastServerDataAt : float;
+    private var lastConnectionCheckAt : float;
+    private var connectionNeverWarned : bool;
+    private var connectionLostShown : bool;
+    default lastServerDataAt = -1;
 
     private var lightAttackAnims : array<r_Anim>;
     private var heavyAttackAnims : array<r_Anim>;
@@ -194,6 +199,8 @@ statemachine class r_MultiplayerClient
     // party
     private var inParty : bool;
     private var joinedParty : string;
+    private var autoJoinSuppressed : bool;
+    private var nextAutoJoinCheckAt : float;
     private var nextWeatherSyncAt : float;
     default nextWeatherSyncAt = -999;
 
@@ -835,6 +842,32 @@ statemachine class r_MultiplayerClient
         if(val == "DialogAction_AUCTION" || val == "27")           return DialogAction_AUCTION;
 
         return DialogAction_NONE;
+    }
+
+    public function updateAutoJoin()
+    {
+        var target : string;
+        var now : float;
+
+        if(inParty || autoJoinSuppressed)
+        {
+            return;
+        }
+
+        now = theGame.GetEngineTimeAsSeconds();
+        if(now < nextAutoJoinCheckAt)
+        {
+            return;
+        }
+        nextAutoJoinCheckAt = now + 2.0;
+
+        target = WO_AutoJoinTarget();
+        if(target == "" || target == username || !getGlobalPlayerByUsername(target))
+        {
+            return;
+        }
+
+        joinParty(target);
     }
 
     public function updateWorldSync()
@@ -1506,6 +1539,7 @@ statemachine class r_MultiplayerClient
 
         inParty = false;
         joinedParty = "";
+        autoJoinSuppressed = true;
 
         theGame.GetGuiManager().ShowNotification(GetLocStringById(2111114207));
 
@@ -3574,6 +3608,50 @@ statemachine class r_MultiplayerClient
     public function setServerReceived(val : bool)
     {
         serverReceived = val;
+        if(val)
+        {
+            lastServerDataAt = theGame.GetEngineTimeAsSeconds();
+        }
+    }
+
+    // Plain messages instead of silence when the other player can't be heard. Messages stay ASCII: the script
+    // compiler's handling of non-ASCII string literals isn't verified on this build.
+    private function checkConnection()
+    {
+        var now : float;
+
+        now = theGame.GetEngineTimeAsSeconds();
+
+        // the loop doesn't run while the game is paused; don't count a pause as silence
+        if(lastServerDataAt >= 0 && now - lastConnectionCheckAt > 2.0)
+        {
+            lastServerDataAt = now;
+        }
+        lastConnectionCheckAt = now;
+
+        if(lastServerDataAt < 0)
+        {
+            if(!connectionNeverWarned && now - spawnTime > 45.0)
+            {
+                connectionNeverWarned = true;
+                theGame.GetGuiManager().ShowNotification("Co-op: spoluhrace zatim nevidim. Bezi u hosta okno 'Host LAN co-op' a jste oba ve hre?");
+            }
+            return;
+        }
+
+        if(now - lastServerDataAt > 10.0)
+        {
+            if(!connectionLostShown)
+            {
+                connectionLostShown = true;
+                theGame.GetGuiManager().ShowNotification("Co-op: spoluhrac se odpojil nebo spadlo spojeni. Po navratu se pripoji sam.");
+            }
+        }
+        else if(connectionLostShown)
+        {
+            connectionLostShown = false;
+            theGame.GetGuiManager().ShowNotification("Co-op: spoluhrac je zpet.");
+        }
     }
 
     public function getServerReceived() : bool
@@ -5178,6 +5256,8 @@ statemachine class r_MultiplayerClient
             showUsernameTaken();
             setAlertedDisconnect();
         }
+
+        checkConnection();
     }
 
     protected var poly : bool;
@@ -7688,8 +7768,11 @@ state WO_Tick in r_MultiplayerClient
 
     entry function wo_tickEntry()
 	{
+        var frame : int;
+
         while(true)
         {
+            frame += 1;
             parent.WO_PumpTransport();
 
             parent.updateCompanionIcons();
@@ -7701,6 +7784,7 @@ state WO_Tick in r_MultiplayerClient
             }
 
             parent.getCoopEnemies().Tick();
+            WO_RemoveCoopSlowdowns();
 
             if(theGame.GetInGameConfigWrapper().GetVarValue('MPGhosts_Main', 'MPGhosts_HideGhosts'))
             {
@@ -7725,14 +7809,22 @@ state WO_Tick in r_MultiplayerClient
             parent.renderPlayers();
             parent.updatePlayerChat();
             parent.updateLocalEmoteLoop();
-            parent.pruneGlobalPlayers(5);
-            parent.checkOutgoingTrades();
-            parent.checkIncomingGwentRequests();
+            // bookkeeping and HUD work every third frame (staggered) to spare weaker PCs
+            if(frame % 3 == 0)
+            {
+                parent.pruneGlobalPlayers(5);
+                parent.checkOutgoingTrades();
+                parent.checkIncomingGwentRequests();
+            }
             parent.checkRidingAttachment();
             parent.checkPlayerChange();
+            parent.updateAutoJoin();
             parent.updateWorldSync();
             parent.updateLeaderDialogReadyPopup();
-            MP_SU_moveMinimapPins();
+            if(frame % 3 == 1)
+            {
+                MP_SU_moveMinimapPins();
+            }
 
             SleepOneFrame();
         }

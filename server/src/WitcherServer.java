@@ -61,12 +61,35 @@ public class WitcherServer
     private static volatile HttpServer statusServer = null;
     private static volatile String cachedStatusFontBase64 = "";
 
+    private static final String LAN_PROTOCOL = "1";
+    private static final String MOD_VERSION = "0.3.0-dev";
+
+    private static volatile int gamePort = DEFAULT_PORT;
+    private static volatile int savePort = 0;
+    private static volatile Path savesDir = null;
+
     private static final AtomicInteger nextPlayerId = new AtomicInteger(1);
 
     public static void main(String[] args) throws Exception
     {
         Properties serverProperties = loadServerProperties();
+        String savesArg = null;
+        List<String> positional = new ArrayList<>();
+        for (int i = 0; i < args.length; i++)
+        {
+            if ("--saves".equals(args[i]) && i + 1 < args.length)
+            {
+                savesArg = args[++i];
+            }
+            else
+            {
+                positional.add(args[i]);
+            }
+        }
+        args = positional.toArray(new String[0]);
+
         int port = choosePort(args, serverProperties);
+        gamePort = port;
         whitelistEnabled.set(readBoolean(serverProperties, "whitelist", false));
 
         loadBannedIps();
@@ -84,6 +107,25 @@ public class WitcherServer
             statusServer = startStatusServer(svgPort);
         }
 
+        if (savesArg != null && Files.isDirectory(Paths.get(savesArg)))
+        {
+            savesDir = Paths.get(savesArg);
+            savePort = port + 1;
+            HttpServer saveServer = (statusServer != null && svgPort == savePort)
+                    ? statusServer
+                    : HttpServer.create(new InetSocketAddress(savePort), 0);
+            saveServer.createContext("/save", WitcherServer::handleSaveDownload);
+            if (saveServer != statusServer)
+            {
+                saveServer.setExecutor(null);
+                saveServer.start();
+            }
+        }
+        else if (savesArg != null)
+        {
+            dbg("Save folder not found, the other player won't get your save: %s\n", savesArg);
+        }
+
         dbgNotime("Launching Witcher Online for The Witcher 3: Wild Hunt...\n");
         dbgNotime("Author: rejuvenate7 - Github: https://github.com/rejuvenate7\n");
         dbg("Starting Witcher Online server on *:%d\n", port);
@@ -92,6 +134,11 @@ public class WitcherServer
         {
             dbg("Starting Witcher Online status SVG server on *:%d\n", svgPort);
             dbg("Status SVG: http://127.0.0.1:%d/status.svg\n", svgPort);
+        }
+
+        if (savesDir != null)
+        {
+            dbg("Sharing your newest save with the other player on TCP %d (home network only): %s\n", savePort, savesDir);
         }
 
         dbg("For help, type \"help\" or \"?\"\n");
@@ -138,6 +185,72 @@ public class WitcherServer
         server.start();
 
         return server;
+    }
+
+    private static boolean isHomeNetwork(java.net.InetAddress address)
+    {
+        return address.isLoopbackAddress() || address.isSiteLocalAddress() || address.isLinkLocalAddress();
+    }
+
+    // Zip of the host's newest save (.sav plus its .png/.json), for the joining player's co-op slot.
+    private static void handleSaveDownload(HttpExchange exchange) throws IOException
+    {
+        if (!isHomeNetwork(exchange.getRemoteAddress().getAddress()))
+        {
+            sendHttp(exchange, 403, "text/plain; charset=utf-8", "home network only");
+            return;
+        }
+
+        if (!"GET".equals(exchange.getRequestMethod()))
+        {
+            sendHttp(exchange, 405, "text/plain; charset=utf-8", "GET only");
+            return;
+        }
+
+        Path newest = null;
+        try (java.util.stream.Stream<Path> files = Files.list(savesDir))
+        {
+            newest = files
+                    .filter(p -> p.getFileName().toString().toLowerCase(Locale.ROOT).endsWith(".sav"))
+                    .max(java.util.Comparator.comparingLong(p -> p.toFile().lastModified()))
+                    .orElse(null);
+        }
+
+        if (newest == null)
+        {
+            sendHttp(exchange, 404, "text/plain; charset=utf-8", "no save yet");
+            return;
+        }
+
+        String fileName = newest.getFileName().toString();
+        String base = fileName.substring(0, fileName.length() - 4);
+
+        java.io.ByteArrayOutputStream buffer = new java.io.ByteArrayOutputStream();
+        try (java.util.zip.ZipOutputStream zip = new java.util.zip.ZipOutputStream(buffer))
+        {
+            for (String ext : new String[] { ".sav", ".png", ".json" })
+            {
+                Path part = savesDir.resolve(base + ext);
+                if (!Files.isRegularFile(part))
+                {
+                    continue;
+                }
+                zip.putNextEntry(new java.util.zip.ZipEntry(base + ext));
+                zip.write(Files.readAllBytes(part));
+                zip.closeEntry();
+            }
+        }
+
+        byte[] body = buffer.toByteArray();
+        exchange.getResponseHeaders().set("Content-Type", "application/zip");
+        exchange.getResponseHeaders().set("X-Save-Name", base);
+        exchange.sendResponseHeaders(200, body.length);
+        try (OutputStream out = exchange.getResponseBody())
+        {
+            out.write(body);
+        }
+
+        dbg("Sent save %s to %s\n", base, exchange.getRemoteAddress().getAddress().getHostAddress());
     }
 
     private static void handleStatusSvg(HttpExchange exchange) throws IOException
@@ -539,6 +652,12 @@ public class WitcherServer
         }
 
         String opcode = parts[0];
+
+        if ("DISCOVER".equals(opcode) && "W3COOP".equals(parts[1]))
+        {
+            safeSend(socket, sender, "W3COOP_HOST\t" + LAN_PROTOCOL + "\t" + MOD_VERSION + "\t" + gamePort + "\t" + savePort);
+            return;
+        }
 
         if (!isUpdateOpcode(opcode))
         {

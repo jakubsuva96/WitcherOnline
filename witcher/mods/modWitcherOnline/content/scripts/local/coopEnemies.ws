@@ -588,7 +588,7 @@ class r_CoopEnemies
             {
                 PoseChecks(now);
             }
-            if(CommitDueAttacks(now) || now - lastHostSend >= 0.1)
+            if(CommitDueAttacks(now) || now - lastHostSend >= COOP_SEND_INTERVAL())
             {
                 HostCollect(client, now);
                 HostSend();
@@ -1409,7 +1409,7 @@ class r_CoopEnemies
         var h : r_CoopHurt;
         var i, j : int;
 
-        if((hurts.Size() == 0 && lastHurtSentCount == 0) || now - lastHurtSend < 0.1)
+        if((hurts.Size() == 0 && lastHurtSentCount == 0) || now - lastHurtSend < COOP_SEND_INTERVAL())
         {
             return;
         }
@@ -3963,7 +3963,7 @@ class r_CoopEnemies
         {
             return;
         }
-        if(now - lastHitSend < 0.1)
+        if(now - lastHitSend < COOP_SEND_INTERVAL())
         {
             return;
         }
@@ -4486,6 +4486,12 @@ function CoopSlotSwing(task : string) : bool
 function COOP_SHARE_RANGE() : float
 {
     return 60.0;
+}
+
+// seconds between enemy snapshots, hit claims and hurts; 0.1 was tuned for Steam relay, a home network takes 0.05
+function COOP_SEND_INTERVAL() : float
+{
+    return 0.05;
 }
 
 // enum events ('RotateEvent': an attacker turns to its target) also name a shared monster's attack animation

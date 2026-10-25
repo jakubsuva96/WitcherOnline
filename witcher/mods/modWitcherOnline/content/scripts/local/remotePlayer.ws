@@ -267,6 +267,7 @@ statemachine class r_RemotePlayer
     public var lastcpcItem9 : string;
     public var lastcpcItem10 : string;
 
+    public var cpcHeadTemp : CEntityTemplate;
     public var cpcHairTemp : CEntityTemplate;
     public var cpcBodyTemp : CEntityTemplate;
     public var cpcTorsoTemp : CEntityTemplate;
@@ -741,6 +742,7 @@ statemachine class r_RemotePlayer
 
         oneliner.visible = true;
         oneliner.entity = ghost;
+        oneliner.head = true;
         oneliner.tag = tag;
         oneliner.intTag = MP_SUOL_usernameKey(serverPlayerId);
 
@@ -6343,6 +6345,7 @@ state WO_UpdateCPC in r_RemotePlayer
 
     private function removeTemplates()
     {
+        parent.removeTemplate(parent.cpcHeadTemp);
         parent.removeTemplate(parent.cpcHairTemp);
         parent.removeTemplate(parent.cpcBodyTemp);
         parent.removeTemplate(parent.cpcTorsoTemp);
@@ -7074,8 +7077,8 @@ state WO_UpdateCPC in r_RemotePlayer
 
                 if(parent.cpcPlayerType == ENR_PlayerCiri)
                 {
-                    // ciri head
-                    parent.EquipNewItem(parent.ghost.GetInventory(), parent.last_eq_head, 'nr_h_01_wa__ciri');
+                    // nr_h_01_wa__ciri came from Custom Player Characters, which the Remastered port doesn't ship
+                    parent.cpcHeadTemp = updateTemplate("characters/models/main_npc/ciri/h_01_wa__ciri.w2ent", parent.cpcHeadTemp);
                     parent.headOverride = true;
                     
                     parent.unmountHair();

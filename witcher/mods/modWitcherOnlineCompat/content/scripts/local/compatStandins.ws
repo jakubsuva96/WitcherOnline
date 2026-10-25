@@ -178,6 +178,9 @@ function NR_GetMagicManager() : NR_MagicManager { return theGame.WO_CompatMagicM
 function NR_GetRandomGenerator() : NR_RandomGenerator { return theGame.WO_CompatRandom(); }
 function NR_IsSceneInPreviewState() : bool { return false; }
 
+// Party leader to join automatically once they are online; "" on the leader's own PC (two-way auto-join would loop).
+function WO_AutoJoinTarget() : string { return ""; }
+
 // Chill Out: no seats; the classes exist only so Witcher Online's hooks compile.
 enum EChillSpotType
 {
