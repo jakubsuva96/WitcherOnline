@@ -573,7 +573,8 @@ class r_CoopEnemies
 
         client = theGame.r_getMultiplayerClient();
         localOnly = theGame.GetInGameConfigWrapper().GetVarValue('MPGhosts_Main', 'MPGhosts_LocalEnemiesOnly');
-        if(!client || localOnly)
+        // Ctrl+F9 (the kill switch) works like the menu option: each world on its own again
+        if(!client || localOnly || client.CoopSwitchedOff())
         {
             return 0;
         }
@@ -4353,7 +4354,8 @@ class r_CoopEnemies
 
     // ---------------------------------------------------------------- quest facts
 
-    // A save was loaded: fact changes count from here (the journal list works the same way).
+    // The player spawned (a save loaded, a world change or a Ciri swap). The native keeps the first baseline of the
+    // game session, so fact changes count from the first load, not from the latest spawn.
     public function OnSessionStart()
     {
         factsReady = WO_FactsBaseline();

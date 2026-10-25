@@ -21,6 +21,14 @@ public class PlayerSession
     public final Map<String, List<String>> coopFields = new ConcurrentHashMap<>();
     // when each channel was last forwarded on arrival (System.nanoTime): the broadcast tick doesn't repeat it so soon
     public final Map<String, Long> coopForwardedAt = new ConcurrentHashMap<>();
+    // when each channel last arrived from the player: a channel the player stopped sending (its role changed) goes stale
+    public final Map<String, Long> coopReceivedAt = new ConcurrentHashMap<>();
+
+    // version handshake (HELLO): sessions without one are dropped after a grace period
+    public final long createdAt;
+    public volatile boolean helloSeen = false;
+    public volatile String modVersion = "";
+    public volatile String gameVersion = "";
 
     public PlayerSession(int playerId, String username, ClientEndpoint endpoint, long lastSeen)
     {
@@ -28,5 +36,6 @@ public class PlayerSession
         this.username = username;
         this.endpoint = endpoint;
         this.lastSeen = lastSeen;
+        this.createdAt = lastSeen;
     }
 }

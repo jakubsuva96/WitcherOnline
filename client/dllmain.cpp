@@ -1,5 +1,7 @@
 #include "NativeBridge.h"
+#include "crash.h"
 #include "pch.h"
+#include "profile.h"
 
 #include <windows.h>
 
@@ -26,6 +28,45 @@ namespace fs = std::filesystem;
 static std::string username = "Player";
 static std::string ip = "46.62.255.79";
 static std::string port = "40000";
+
+// The receiver thread renames the player when the server says the name is taken, while the sender thread builds
+// packets with it.
+static std::mutex usernameMu;
+
+static std::string GetLocalUsername()
+{
+	std::lock_guard<std::mutex> lock(usernameMu);
+	return username;
+}
+
+static void SetLocalUsername(const std::string &name)
+{
+	{
+		std::lock_guard<std::mutex> lock(usernameMu);
+		username = name;
+	}
+	wo_native::SetUsername(name);
+}
+
+// W3Coop version handshake: HELLO until the server answers WELCOME, or an ERROR saying what doesn't match.
+// Keep in step with WitcherServer.PROTOCOL_VERSION / MOD_VERSION.
+static const char *const kProtocolVersion = "1";
+static const char *const kModVersion = "0.3.0-dev";
+static constexpr int kHelloAttempts = 15;
+static constexpr ULONGLONG kHelloIntervalMs = 1000;
+static std::string g_gameVersion = "unknown";
+static std::atomic<bool> g_welcomed{false};
+static std::atomic<int> g_helloAttemptsSent{0};
+static std::atomic<ULONGLONG> g_lastHelloTick{0};
+static int g_crashReportPort = 0;
+
+// "Player", "Player2", ...: a name the server has already given to someone else gets a number instead of ending the
+// session (two PCs that both kept the default name used to lock the second one out)
+static constexpr int kMaxRenames = 5;
+static constexpr ULONGLONG kRenameSettleMs = 1500;
+static std::string g_baseUsername = "Player";
+static int g_renames = 0;
+static ULONGLONG g_lastRenameTick = 0;
 static HANDLE g_initThread = NULL;
 static std::atomic<int> g_localPlayerId{0};
 static std::atomic<bool> g_shutdown{false};
@@ -289,8 +330,8 @@ static std::string BuildLocalPacketId()
 {
 	const int localPlayerId = g_localPlayerId.load();
 	if (localPlayerId > 0)
-		return std::to_string(localPlayerId) + "\t" + EscapeField(username);
-	return EscapeField(username);
+		return std::to_string(localPlayerId) + "\t" + EscapeField(GetLocalUsername());
+	return EscapeField(GetLocalUsername());
 }
 
 static int g_movementSequence = static_cast<int>(((GetTickCount64() / 20ULL) % 1000000000ULL) + 1ULL);
@@ -743,16 +784,195 @@ static void QueueUpdate4(int playerId, const std::string &playerUsername, std::v
 	wo_native::PushInbound(std::move(message));
 }
 
+static void ResetHandshake()
+{
+	g_welcomed.store(false);
+	g_helloAttemptsSent.store(0);
+	g_lastHelloTick.store(0);
+}
+
+static void SendHelloIfDue()
+{
+	if (g_welcomed.load() || !wo_native::IsConnected())
+		return;
+
+	const ULONGLONG now = GetTickCount64();
+	const ULONGLONG last = g_lastHelloTick.load();
+	if (last != 0 && now - last < kHelloIntervalMs)
+		return;
+
+	const int sent = g_helloAttemptsSent.load();
+	if (sent >= kHelloAttempts)
+	{
+		if (sent == kHelloAttempts)
+		{
+			wo_native::DebugLog("handshake: the server never answered HELLO (a server older than W3Coop " + std::string(kModVersion) + "?); playing on without a version check");
+			g_helloAttemptsSent.store(sent + 1);
+		}
+		return;
+	}
+
+	g_lastHelloTick.store(now);
+	g_helloAttemptsSent.store(sent + 1);
+	SendUdpPacket("HELLO\t" + EscapeField(GetLocalUsername()) + "\t" + kProtocolVersion + "\t" + kModVersion + "\t" + g_gameVersion, "HELLO");
+}
+
+static bool TryRenameAfterTaken()
+{
+	const ULONGLONG now = GetTickCount64();
+
+	// packets sent under the old name are still answered with USERNAME_TAKEN for a moment
+	if (g_lastRenameTick != 0 && now - g_lastRenameTick < kRenameSettleMs)
+		return true;
+
+	if (g_renames >= kMaxRenames)
+		return false;
+
+	++g_renames;
+	g_lastRenameTick = now;
+
+	std::string base = g_baseUsername;
+	if (base.length() > 14)
+		base.resize(14);
+	const std::string renamed = base + std::to_string(g_renames + 1);
+
+	wo_native::DebugLog("username " + GetLocalUsername() + " is taken on this server; playing as " + renamed);
+	SetLocalUsername(renamed);
+	g_localPlayerId.store(0);
+	wo_native::SetLocalId(0);
+	ResetHandshake();
+	return true;
+}
+
+static bool g_sendCrashReports = true;
+static ULONGLONG g_lastCrashHandlerCheck = 0;
+static constexpr ULONGLONG kCrashHandlerCheckMs = 30000;
+
+// the game installs its own crash handler some time after startup; keep W3Coop's in front of it (it chains on)
+static void ReinstallCrashHandlerIfDue()
+{
+	const ULONGLONG now = GetTickCount64();
+	if (now - g_lastCrashHandlerCheck < kCrashHandlerCheckMs)
+		return;
+	g_lastCrashHandlerCheck = now;
+	wo_crash::Reinstall();
+}
+
+// the host answered the handshake: it is the one to collect crash reports from earlier sessions
+static void OnWelcome()
+{
+	if (!g_sendCrashReports || g_crashReportPort <= 0)
+		return;
+
+	std::string host = ip;
+	try
+	{
+		host = serverEndpoint.address().to_string();
+	}
+	catch (...)
+	{
+	}
+	wo_crash::UploadPending(host, g_crashReportPort, GetLocalUsername());
+}
+
+// Connection watchdog: the server repeats state every 100 ms (33 ms on LAN), so a few seconds of silence means the
+// host is gone or the network dropped. The player is told, and told again when packets come back.
+static constexpr ULONGLONG kConnectionLostMs = 6000;
+static std::atomic<ULONGLONG> g_lastServerPacketTick{0};
+static std::atomic<bool> g_connectionLost{false};
+
+static void CheckConnection()
+{
+	const ULONGLONG last = g_lastServerPacketTick.load();
+	if (!wo_native::IsConnected() || last == 0 || g_connectionLost.load())
+		return;
+
+	if (GetTickCount64() - last > kConnectionLostMs)
+	{
+		g_connectionLost.store(true);
+		wo_native::DebugLog("connection: nothing from the server for " + std::to_string(kConnectionLostMs / 1000) + " s");
+		wo_native::PushControl(wo_native::InboundOpcode::ConnectionLost);
+	}
+}
+
+static void NoteServerPacket()
+{
+	g_lastServerPacketTick.store(GetTickCount64());
+	if (g_connectionLost.exchange(false))
+	{
+		wo_native::DebugLog("connection: the server answers again");
+		wo_native::PushControl(wo_native::InboundOpcode::ConnectionRestored);
+	}
+}
+
+// Co-op kill switch: Ctrl+F9 while the game window is in front. Polled, so no input files of the game change.
+static bool g_killSwitchDown = false;
+
+static void PollKillSwitchHotkey()
+{
+	HWND front = GetForegroundWindow();
+	DWORD pid = 0;
+	if (front)
+		GetWindowThreadProcessId(front, &pid);
+
+	const bool down = pid == GetCurrentProcessId() && (GetAsyncKeyState(VK_CONTROL) & 0x8000) && (GetAsyncKeyState(VK_F9) & 0x8000);
+	if (down && !g_killSwitchDown)
+	{
+		wo_native::DebugLog("kill switch: Ctrl+F9");
+		wo_native::PushControl(wo_native::InboundOpcode::ToggleCoop);
+	}
+	g_killSwitchDown = down;
+}
+
 static void HandleServerPacket(const std::string &msg)
 {
 	auto parts = SplitTabs(msg);
 	if (parts.empty())
 		return;
 
+	NoteServerPacket();
+
+	// "HOST \t username": a server started with --lan names the player on the PC that runs it
+	if (parts[0] == "HOST")
+	{
+		if (parts.size() >= 2)
+			wo_native::SetHostName(parts[1]);
+		return;
+	}
+
+	if (parts[0] == "WELCOME")
+	{
+		if (!g_welcomed.exchange(true))
+		{
+			wo_native::DebugLog("handshake: host runs W3Coop " + (parts.size() >= 2 ? parts[1] : std::string("?")) + ", same as this game");
+			// "WELCOME \t modVersion \t protocol \t crashReportPort [\t host]" (port 0: the host takes no crash reports;
+			// host: the player on the server's PC, when the server runs with --lan)
+			int crashPort = 0;
+			if (parts.size() >= 4 && ParsePositiveInt(parts[3], crashPort))
+				g_crashReportPort = crashPort;
+			if (parts.size() >= 5 && !parts[4].empty())
+				wo_native::SetHostName(parts[4]);
+			OnWelcome();
+		}
+		return;
+	}
+
 	if (parts[0] == "ERROR")
 	{
 		if (parts.size() >= 2 && parts[1] == "USERNAME_TAKEN")
+		{
+			if (TryRenameAfterTaken())
+				return;
 			wo_native::PushControl(wo_native::InboundOpcode::UsernameTaken);
+		}
+		else if (parts.size() >= 2 && (parts[1] == "VERSION_MISMATCH" || parts[1] == "GAME_VERSION_MISMATCH"))
+		{
+			const bool game = parts[1] == "GAME_VERSION_MISMATCH";
+			const std::string hostVersion = parts.size() >= 3 ? parts[2] : std::string("unknown");
+			const std::string mine = game ? g_gameVersion : std::string(kModVersion);
+			wo_native::DebugLog(std::string("handshake: ") + (game ? "game" : "W3Coop") + " version mismatch: host has " + hostVersion + ", this game has " + mine);
+			wo_native::PushControl(wo_native::InboundOpcode::VersionMismatch, {game ? "game" : "mod", hostVersion, mine});
+		}
 		else if (parts.size() >= 2 && parts[1] == "BANNED")
 			wo_native::PushControl(wo_native::InboundOpcode::Banned);
 		else if (parts.size() >= 2 && parts[1] == "NOT_WHITELISTED")
@@ -785,7 +1005,7 @@ static void HandleServerPacket(const std::string &msg)
 	if (playerUsername.empty())
 		return;
 
-	if (playerUsername == username)
+	if (playerUsername == GetLocalUsername())
 	{
 		g_localPlayerId.store(playerId);
 		wo_native::SetLocalId(playerId);
@@ -974,6 +1194,11 @@ static void SenderThread()
 		if (wo_native::IsConnected() && SendTransportKeepaliveIfDue())
 			worked = true;
 
+		SendHelloIfDue();
+		ReinstallCrashHandlerIfDue();
+		CheckConnection();
+		PollKillSwitchHotkey();
+
 		if (!worked)
 			Sleep(1);
 	}
@@ -1042,6 +1267,88 @@ static std::string GetEnv(const char *name)
 	return out;
 }
 
+// "5.0.15.65482": the exe's version resource (the handshake refuses two players on different game builds)
+static std::string GameExeVersion()
+{
+	wchar_t path[MAX_PATH]{};
+	if (GetModuleFileNameW(nullptr, path, MAX_PATH) == 0)
+		return "unknown";
+
+	DWORD ignored = 0;
+	const DWORD bytes = GetFileVersionInfoSizeW(path, &ignored);
+	if (bytes == 0)
+		return "unknown";
+
+	std::vector<uint8_t> data(bytes);
+	VS_FIXEDFILEINFO *info = nullptr;
+	UINT infoSize = 0;
+	if (!GetFileVersionInfoW(path, 0, bytes, data.data()) || !VerQueryValueW(data.data(), L"\\", reinterpret_cast<LPVOID *>(&info), &infoSize) || !info)
+		return "unknown";
+
+	return std::to_string(HIWORD(info->dwFileVersionMS)) + "." + std::to_string(LOWORD(info->dwFileVersionMS)) + "." + std::to_string(HIWORD(info->dwFileVersionLS)) + "." +
+	       std::to_string(LOWORD(info->dwFileVersionLS));
+}
+
+// ServerIP "auto": broadcast "DISCOVER \t W3COOP \t protocol" on the LAN and take the first host that answers
+// "W3COOP_HOST \t protocol \t modVersion \t port \t players". The answer is a unicast reply to a broadcast, which
+// Windows Firewall lets in by default, so the joining PC needs no firewall rule.
+static constexpr int kDiscoverySeconds = 180;
+
+static bool DiscoverLanHost(std::string &hostIp, std::string &hostPort)
+{
+	int searchPort = 0;
+	if (!ParsePositiveInt(port, searchPort) || searchPort > 65535)
+		searchPort = 40000;
+
+	try
+	{
+		asio::io_context context;
+		asio::ip::udp::socket probe(context);
+		probe.open(asio::ip::udp::v4());
+		probe.set_option(asio::socket_base::broadcast(true));
+		probe.bind(asio::ip::udp::endpoint(asio::ip::udp::v4(), 0));
+
+		DWORD timeoutMs = 500;
+		setsockopt(probe.native_handle(), SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char *>(&timeoutMs), sizeof(timeoutMs));
+
+		const std::string query = std::string("DISCOVER\tW3COOP\t") + kProtocolVersion;
+		const asio::ip::udp::endpoint broadcast(asio::ip::address_v4::broadcast(), static_cast<unsigned short>(searchPort));
+		std::vector<char> data(1024);
+
+		wo_native::DebugLog("discovery: looking for a W3Coop host on the LAN (UDP " + std::to_string(searchPort) + ")");
+		for (int second = 0; second < kDiscoverySeconds && !g_shutdown.load(); ++second)
+		{
+			asio::error_code sendError;
+			probe.send_to(asio::buffer(query), broadcast, 0, sendError);
+
+			for (int wait = 0; wait < 2; ++wait)
+			{
+				asio::ip::udp::endpoint from;
+				asio::error_code receiveError;
+				const std::size_t length = probe.receive_from(asio::buffer(data), from, 0, receiveError);
+				if (receiveError)
+					continue;
+
+				const auto parts = SplitTabs(std::string(data.data(), length));
+				if (parts.size() >= 4 && parts[0] == "W3COOP_HOST")
+				{
+					hostIp = from.address().to_string();
+					hostPort = parts[3];
+					wo_native::DebugLog("discovery: found host " + hostIp + ":" + hostPort + " (W3Coop " + parts[2] + ")");
+					return true;
+				}
+			}
+		}
+	}
+	catch (const std::exception &e)
+	{
+		wo_native::DebugLog(std::string("discovery failed: ") + e.what());
+	}
+
+	wo_native::DebugLog("discovery: no host answered within " + std::to_string(kDiscoverySeconds) + " s; set ServerIP to the host's address in config.xml");
+	return false;
+}
+
 static std::string SanitizeUsername(const std::string &user)
 {
 	std::string out = std::regex_replace(user, std::regex("[^A-Za-z0-9_]"), "");
@@ -1068,25 +1375,38 @@ static void initScript()
 	const std::string envPort = GetEnv("WO_SERVER_PORT");
 
 	const std::string logName = envUsername.empty() ? "WitcherOnline.log" : "WitcherOnline_" + SanitizeUsername(envUsername) + ".log";
-	wo_native::InitLog((woDir / logName).string());
-
-	wo_native::DebugLog("startup");
 
 	fs::path fullPath = woDir / "config.xml";
 
 	pugi::xml_document doc;
 	pugi::xml_parse_result result = doc.load_file(fullPath.c_str());
 
+	std::string configuredName;
+	std::string lanRole;
+	std::string autoLoadSave;
 	if (result)
 	{
 		pugi::xml_node xml = doc.child("Config");
 		if (xml)
 		{
-			username = SanitizeUsername(xml.child("Username").text().as_string());
+			configuredName = xml.child("Username").text().as_string();
 			ip = xml.child("ServerIP").text().as_string();
 			port = xml.child("Port").text().as_string();
+			if (xml.child("SendCrashReports"))
+				g_sendCrashReports = xml.child("SendCrashReports").text().as_bool(true);
+			// written by the LAN launchers: "host" or "member", and the save "Join LAN co-op.cmd" brought over
+			lanRole = xml.child("Role").text().as_string();
+			autoLoadSave = xml.child("AutoLoadSave").text().as_string();
 		}
 	}
+	if (lanRole != "host" && lanRole != "member")
+		lanRole.clear();
+	wo_native::SetLanInfo(lanRole, autoLoadSave);
+
+	// the package's default "Player" becomes the Windows account name, so two PCs don't start out with the same name
+	if (configuredName.empty() || configuredName == "Player")
+		configuredName = GetEnv("USERNAME");
+	username = SanitizeUsername(configuredName);
 
 	if (!envUsername.empty())
 		username = SanitizeUsername(envUsername);
@@ -1095,14 +1415,41 @@ static void initScript()
 	if (!envPort.empty())
 		port = envPort;
 
-	wo_native::DebugLog("username=" + username + " server=" + ip + ":" + port);
+	g_baseUsername = username;
+	g_gameVersion = GameExeVersion();
 
-	wo_native::SetUsername(username);
+	// before the log opens: keeps the last session's log and files a report if that session never exited cleanly
+	wo_crash::Install(woDir, logName, {username, kModVersion, g_gameVersion, ip + ":" + port});
+
+	wo_native::InitLog((woDir / logName).string());
+
+	wo_native::DebugLog("startup: W3Coop " + std::string(kModVersion) + " (protocol " + kProtocolVersion + "), game " + g_gameVersion);
+	wo_native::DebugLog("username=" + username + " server=" + ip + ":" + port + (lanRole.empty() ? "" : " LAN role=" + lanRole) +
+	                    (autoLoadSave.empty() ? "" : " save to load=" + autoLoadSave));
+	if (!wo_profile::Documents().empty())
+		wo_native::DebugLog("co-op profile: Documents -> " + fs::path(wo_profile::Documents()).u8string());
+
+	SetLocalUsername(username);
 
 	if (!wo_native::RegisterNatives())
 	{
 		wo_native::DebugLog("failed to register WitcherOnline native functions");
 		return;
+	}
+
+	if (ip == "auto" || ip == "lan")
+	{
+		std::string foundIp, foundPort;
+		if (DiscoverLanHost(foundIp, foundPort))
+		{
+			ip = foundIp;
+			port = foundPort;
+		}
+		else
+		{
+			ip = "127.0.0.1";
+			wo_native::PushControl(wo_native::InboundOpcode::NoHostFound);
+		}
 	}
 
 	connectServer();
@@ -1127,6 +1474,8 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
 	{
 	case DLL_PROCESS_ATTACH:
 		DisableThreadLibraryCalls(hModule);
+		// here, not on the init thread: the game may ask for its Documents folder before that thread runs
+		wo_profile::InstallIfConfigured(getExecutablePath() / "WitcherOnline");
 		g_initThread = CreateThread(nullptr, 0, InitThreadProc, nullptr, 0, nullptr);
 		if (g_initThread)
 		{
@@ -1136,6 +1485,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
 		break;
 
 	case DLL_PROCESS_DETACH:
+		wo_crash::MarkCleanExit();
 		break;
 	}
 

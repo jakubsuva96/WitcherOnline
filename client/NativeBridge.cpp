@@ -77,6 +77,9 @@ namespace wo_native
 	static std::mutex g_stateMutex;
 	static int g_localId = 0;
 	static std::string g_username;
+	static std::string g_hostName;
+	static std::string g_lanRole;
+	static std::string g_autoLoadSave;
 	static std::atomic<bool> g_connected{false};
 
 	// Remastered (5.x) script strings are UTF-8 bytes; Next-Gen (4.x) strings are UTF-16.
@@ -270,6 +273,19 @@ namespace wo_native
 		g_username = name;
 	}
 
+	void SetHostName(const std::string &name)
+	{
+		std::lock_guard<std::mutex> lock(g_stateMutex);
+		g_hostName = name;
+	}
+
+	void SetLanInfo(const std::string &role, const std::string &autoLoadSave)
+	{
+		std::lock_guard<std::mutex> lock(g_stateMutex);
+		g_lanRole = role;
+		g_autoLoadSave = autoLoadSave;
+	}
+
 	void SetConnected(bool connected)
 	{
 		g_connected.store(connected);
@@ -279,6 +295,14 @@ namespace wo_native
 	{
 		InboundMessage message;
 		message.opcode = opcode;
+		PushInbound(std::move(message));
+	}
+
+	void PushControl(InboundOpcode opcode, std::vector<std::string> &&fields)
+	{
+		InboundMessage message;
+		message.opcode = opcode;
+		message.fields = std::move(fields);
 		PushInbound(std::move(message));
 	}
 
@@ -451,9 +475,17 @@ namespace wo_native
 	static bool g_factsBaselineValid = false;
 	static size_t g_factsPage = 0;
 
-	// session start (a save loaded): changes are counted from here
+	// session start: changes are counted from the first save this game loads. Scripts call this on every player
+	// spawn, which also happens on each world change and Ciri swap; re-recording there made a member who joined
+	// later miss every change made before it, so a valid baseline is kept for the rest of the process.
 	static void WO_FactsBaseline(void *, void *frame, void *result)
 	{
+		if (g_factsBaselineValid)
+		{
+			WNB_ReturnBool(frame, result, true);
+			return;
+		}
+
 		g_factsBaseline.clear();
 		g_factsBaselineValid = ReadAllFacts(g_factsBaseline);
 		g_factsPage = 0;
@@ -684,6 +716,17 @@ namespace wo_native
 				localId = g_localId;
 			}
 			ReturnString(frame, result, std::to_string(localId));
+			return;
+		}
+		// -6 host name, -7 LAN role, -8 handed-over save
+		if (index == -6 || index == -7 || index == -8)
+		{
+			std::string value;
+			{
+				std::lock_guard<std::mutex> lock(g_stateMutex);
+				value = index == -6 ? g_hostName : (index == -7 ? g_lanRole : g_autoLoadSave);
+			}
+			ReturnString(frame, result, value);
 			return;
 		}
 

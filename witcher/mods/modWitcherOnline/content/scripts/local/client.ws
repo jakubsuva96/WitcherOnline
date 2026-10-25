@@ -1626,6 +1626,34 @@ statemachine class r_MultiplayerClient
         return true;
     }
 
+    // ---------------------------------------------------------------- LAN co-op: party, notices, kill switch
+
+    private var coopSwitchedOff : bool;
+
+    public function coopNotice(text : string)
+    {
+        theGame.GetGuiManager().ShowNotification("Co-op: " + text);
+    }
+
+    // Ctrl+F9: shared enemies and quest sync off (each world on its own again) and back on; players still see each other
+    public function toggleCoopSwitch()
+    {
+        coopSwitchedOff = !coopSwitchedOff;
+        if(coopSwitchedOff)
+        {
+            coopNotice("sdílení nepřátel a questů VYPNUTO (Ctrl+F9 ho zase zapne).");
+        }
+        else
+        {
+            coopNotice("sdílení nepřátel a questů ZAPNUTO.");
+        }
+    }
+
+    public function CoopSwitchedOff() : bool
+    {
+        return coopSwitchedOff;
+    }
+
     private function leavePartyBecauseTargetLeft()
     {
         var oldParty : string;
@@ -5187,7 +5215,41 @@ statemachine class r_MultiplayerClient
         tutorialPopup(messagetitle, messagebody);
     }
 
-    private var usernameTakenUser : string; 
+    // W3Coop version handshake: the host refused this game because the mod or the game build differs
+    function showVersionMismatch()
+    {
+        var messagetitle : string;
+        var messagebody : string;
+
+        messagetitle = GetLocStringById(2111114249);
+        if(versionMismatchWhat == "game")
+        {
+            messagebody = "Host má verzi hry " + versionMismatchHost + ", tahle hra je " + versionMismatchMine
+                + ".<br/><br/>Oba hráči potřebují stejnou verzi Zaklínače 3.";
+        }
+        else
+        {
+            messagebody = "Host má W3Coop " + versionMismatchHost + ", tahle hra má " + versionMismatchMine
+                + ".<br/><br/>Na obou PC musí být stejná verze modu.";
+        }
+
+        tutorialPopup(messagetitle, messagebody);
+    }
+
+    private var versionMismatch : bool;
+    private var versionMismatchWhat : string;
+    private var versionMismatchHost : string;
+    private var versionMismatchMine : string;
+
+    function setVersionMismatch(what : string, hostVersion : string, mine : string)
+    {
+        versionMismatch = true;
+        versionMismatchWhat = what;
+        versionMismatchHost = hostVersion;
+        versionMismatchMine = mine;
+    }
+
+    private var usernameTakenUser : string;
     private var usernameTaken : bool;
     private var playerBanned : bool;
     private var playerKicked : bool;
@@ -5265,6 +5327,11 @@ statemachine class r_MultiplayerClient
         else if(getUsernameTaken() && !getAlertedDisconnect())
         {
             showUsernameTaken();
+            setAlertedDisconnect();
+        }
+        else if(versionMismatch && !getAlertedDisconnect())
+        {
+            showVersionMismatch();
             setAlertedDisconnect();
         }
 
@@ -5606,6 +5673,30 @@ statemachine class r_MultiplayerClient
         return WO_Str(-4);
     }
 
+    // LAN co-op (the LAN launchers write these into config.xml; the server names the host)
+    function WO_HostName() : string
+    {
+        return WO_Str(-6);
+    }
+
+    // "host", "member", or "" outside LAN co-op
+    function WO_LanRole() : string
+    {
+        return WO_Str(-7);
+    }
+
+    // on a LAN, shared state can go out more often and remote players can follow it more tightly
+    function WO_LanSync() : bool
+    {
+        return WO_LanRole() != "";
+    }
+
+    // the host's save "Join LAN co-op.cmd" brought over, loaded once at the main menu
+    function WO_AutoLoadSaveName() : string
+    {
+        return WO_Str(-8);
+    }
+
     function WO_GlobalPlayerByServerId(serverPlayerId : int) : r_RemotePlayer
     {
         var globals : array<r_RemotePlayer>;
@@ -5848,6 +5939,18 @@ statemachine class r_MultiplayerClient
 
                 case 10:
                     client.getCoopEnemies().OnMessage();
+                    break;
+
+                case 11:
+                    client.setVersionMismatch(WO_Str(0), WO_Str(1), WO_Str(2));
+                    break;
+
+                case 14:
+                    client.toggleCoopSwitch();
+                    break;
+
+                case 15:
+                    client.coopNotice("v síti jsem nenašel hosta. Spusť u hosta 'Host LAN co-op', nebo dej jeho adresu do config.xml.");
                     break;
 
                 default:

@@ -27,7 +27,7 @@ function OnSpawned(spawnData: SEntitySpawnData)
     theGame.r_getMultiplayerClient().WO_PublishPresence(theGame.r_getMultiplayerClient().WO_GetPresence(), true);
 }
 
-@addMethod(CR4Player) 
+@addMethod(CR4Player)
 timer function r_showUsernameAlert(dt : float, id : int)
 {
     theGame.r_getMultiplayerClient().showUsernameTaken();

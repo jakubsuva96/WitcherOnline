@@ -372,6 +372,17 @@ statemachine class r_RemotePlayer
     protected var morphAdjustorDelay : float;
     default morphAdjustorDelay = 0.4;
 
+    // How long the copy takes to slide to each new position. On a LAN, updates come often and on time, so the copy
+    // can follow 0.15 s behind instead of 0.4 s.
+    public function AdjustDelay(normal : float) : float
+    {
+        if(theGame.r_getMultiplayerClient().WO_LanSync())
+        {
+            return MinF(normal, 0.15);
+        }
+        return normal;
+    }
+
     public function setDeck(val : SDeckDefinition)
     {
         gwentGame.deck = val;
@@ -6317,7 +6328,7 @@ statemachine class r_RemotePlayer
         adjustor.Cancel(adjustor.GetRequest('w3mp_ghost'));
         ticket = adjustor.CreateNewRequest('w3mp_ghost');
 
-        adjustor.AdjustmentDuration(ticket, npcAdjustorDelay);
+        adjustor.AdjustmentDuration(ticket, AdjustDelay(npcAdjustorDelay));
         adjustor.AdjustLocationVertically(ticket, true);
         adjustor.ScaleAnimationLocationVertically(ticket, true);
         adjustor.RotateTo(ticket, heading); 
@@ -6659,7 +6670,7 @@ state WO_UpdateCPC in r_RemotePlayer
         adjustor.Cancel(adjustor.GetRequest('w3mp_horsesync'));
         ticket = adjustor.CreateNewRequest('w3mp_horsesync');
 
-        adjustor.AdjustmentDuration(ticket, parent.horseAdjustorDelay);
+        adjustor.AdjustmentDuration(ticket, parent.AdjustDelay(parent.horseAdjustorDelay));
         adjustor.AdjustLocationVertically(ticket, true);
         adjustor.ScaleAnimationLocationVertically(ticket, true);
         adjustor.RotateTo(ticket, parent.heading); 
@@ -6738,7 +6749,7 @@ state WO_UpdateCPC in r_RemotePlayer
         adjustor.Cancel(adjustor.GetRequest('w3mp_boatsync'));
         ticket = adjustor.CreateNewRequest('w3mp_boatsync');
 
-        adjustor.AdjustmentDuration(ticket, parent.boatAdjustorDelay);
+        adjustor.AdjustmentDuration(ticket, parent.AdjustDelay(parent.boatAdjustorDelay));
         adjustor.AdjustLocationVertically(ticket, true);
         adjustor.ScaleAnimationLocationVertically(ticket, true);
         adjustor.RotateTo(ticket, parent.heading); 
@@ -6880,7 +6891,7 @@ state WO_UpdateCPC in r_RemotePlayer
             adjustor.Cancel(adjustor.GetRequest('w3mp_morphsync'));
             ticket = adjustor.CreateNewRequest('w3mp_morphsync');
 
-            adjustor.AdjustmentDuration(ticket, parent.morphAdjustorDelay);
+            adjustor.AdjustmentDuration(ticket, parent.AdjustDelay(parent.morphAdjustorDelay));
             adjustor.AdjustLocationVertically(ticket, true);
             adjustor.ScaleAnimationLocationVertically(ticket, true);
             adjustor.RotateTo(ticket, parent.heading); 
