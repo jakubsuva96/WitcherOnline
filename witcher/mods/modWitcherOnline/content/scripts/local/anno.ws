@@ -23,6 +23,7 @@ function OnSpawned(spawnData: SEntitySpawnData)
     wrappedMethod(spawnData);
 
     theGame.r_getMultiplayerClient().getCoopEnemies().OnSessionStart();
+    theGame.r_getMultiplayerClient().getCoopParty().OnSessionStart();
     theGame.r_getMultiplayerClient().WO_PublishPresence(theGame.r_getMultiplayerClient().WO_GetPresence(), true);
 }
 
@@ -1008,6 +1009,11 @@ function OnDialogOptionAccepted(index : int)
 {
     if(!theGame.r_getMultiplayerClient().isApplyingSyncedDialogChoice())
     {
+        // in a dialogue with the leader, the member waits for the leader's pick
+        if(theGame.r_getMultiplayerClient().getCoopParty().BlocksOwnDialogPick())
+        {
+            return false;
+        }
         theGame.r_getMultiplayerClient().setLastDialog(index);
     }
 

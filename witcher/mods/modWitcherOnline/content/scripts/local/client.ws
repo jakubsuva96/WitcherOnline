@@ -272,6 +272,17 @@ statemachine class r_MultiplayerClient
         return coopEnemies;
     }
 
+    private var coopParty : r_CoopParty;
+
+    public function getCoopParty() : r_CoopParty
+    {
+        if(!coopParty)
+        {
+            coopParty = new r_CoopParty in this;
+        }
+        return coopParty;
+    }
+
     public function WO_SetTeleporting(val : bool)
     {
         wo_isTeleporting = val;
@@ -3614,8 +3625,7 @@ statemachine class r_MultiplayerClient
         }
     }
 
-    // Plain messages instead of silence when the other player can't be heard. Messages stay ASCII: the script
-    // compiler's handling of non-ASCII string literals isn't verified on this build.
+    // Plain messages instead of silence when the other player can't be heard.
     private function checkConnection()
     {
         var now : float;
@@ -3634,7 +3644,7 @@ statemachine class r_MultiplayerClient
             if(!connectionNeverWarned && now - spawnTime > 45.0)
             {
                 connectionNeverWarned = true;
-                theGame.GetGuiManager().ShowNotification("Co-op: spoluhrace zatim nevidim. Bezi u hosta okno 'Host LAN co-op' a jste oba ve hre?");
+                theGame.GetGuiManager().ShowNotification("Co-op: spoluhráče zatím nevidím. Běží u hosta okno 'Host LAN co-op' a jste oba ve hře?");
             }
             return;
         }
@@ -3644,13 +3654,13 @@ statemachine class r_MultiplayerClient
             if(!connectionLostShown)
             {
                 connectionLostShown = true;
-                theGame.GetGuiManager().ShowNotification("Co-op: spoluhrac se odpojil nebo spadlo spojeni. Po navratu se pripoji sam.");
+                theGame.GetGuiManager().ShowNotification("Co-op: spoluhráč se odpojil nebo spadlo spojení. Po návratu se připojí sám.");
             }
         }
         else if(connectionLostShown)
         {
             connectionLostShown = false;
-            theGame.GetGuiManager().ShowNotification("Co-op: spoluhrac je zpet.");
+            theGame.GetGuiManager().ShowNotification("Co-op: spoluhráč je zpět.");
         }
     }
 
@@ -7784,6 +7794,7 @@ state WO_Tick in r_MultiplayerClient
             }
 
             parent.getCoopEnemies().Tick();
+            parent.getCoopParty().Tick();
             WO_RemoveCoopSlowdowns();
 
             if(theGame.GetInGameConfigWrapper().GetVarValue('MPGhosts_Main', 'MPGhosts_HideGhosts'))

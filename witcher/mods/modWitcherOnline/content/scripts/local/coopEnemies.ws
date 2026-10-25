@@ -2072,6 +2072,14 @@ class r_CoopEnemies
         {
             OnFacts(sender, count);
         }
+        else if(WO_Str(0) == "ps")
+        {
+            client.getCoopParty().OnLeaderState(sender, count);
+        }
+        else if(WO_Str(0) == "ms")
+        {
+            client.getCoopParty().OnMemberState(sender, count);
+        }
     }
 
     private function OnSnapshot(sender : string, count : int)
@@ -4893,6 +4901,7 @@ function OnTakeDamage(action : W3DamageAction)
     else if(coop)
     {
         coop.OnEnemyDamaged(this, action);
+        client.getCoopParty().OnNpcDamaged(this, action);
     }
 
     wrappedMethod(action);

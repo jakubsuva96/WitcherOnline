@@ -32,6 +32,10 @@ statemachine class MPDRPlayer extends CNewNPC
 
 		if( actionName == "Interact" )
 		{
+			if(theGame.r_getMultiplayerClient().getCoopParty().TryReviveGhost((CActor)this))
+			{
+				return true;
+			}
 			theGame.r_getMultiplayerClient().createMenu(((CActor)this));
 		}
 	}

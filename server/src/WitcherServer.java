@@ -50,7 +50,8 @@ public class WitcherServer
     private static final long PLAYER_TIMEOUT_NANOS = 5_000_000_000L;
     private static final long USERNAME_HOLD_NANOS = 60_000_000_000L;
     private static final long BROADCAST_HEARTBEAT_NANOS = 60_000_000_000L;
-    private static final int MAX_COOP_CHANNELS = 4;
+    // per player; channels are never released, so this must cover every channel one player's script uses
+    private static final int MAX_COOP_CHANNELS = 8;
     private static final long COOP_REPEAT_NANOS = 100_000_000L;
 
     private static final int DEFAULT_PORT = 40000;
@@ -115,6 +116,7 @@ public class WitcherServer
                     ? statusServer
                     : HttpServer.create(new InetSocketAddress(savePort), 0);
             saveServer.createContext("/save", WitcherServer::handleSaveDownload);
+            saveServer.createContext("/save/name", WitcherServer::handleSaveName);
             if (saveServer != statusServer)
             {
                 saveServer.setExecutor(null);
@@ -192,6 +194,31 @@ public class WitcherServer
         return address.isLoopbackAddress() || address.isSiteLocalAddress() || address.isLinkLocalAddress();
     }
 
+    private static Path newestSave() throws IOException
+    {
+        try (java.util.stream.Stream<Path> files = Files.list(savesDir))
+        {
+            return files
+                    .filter(p -> p.getFileName().toString().toLowerCase(Locale.ROOT).endsWith(".sav"))
+                    .max(java.util.Comparator.comparingLong(p -> p.toFile().lastModified()))
+                    .orElse(null);
+        }
+    }
+
+    // Name of the newest save only, so the join launcher can poll for new saves cheaply.
+    private static void handleSaveName(HttpExchange exchange) throws IOException
+    {
+        if (!isHomeNetwork(exchange.getRemoteAddress().getAddress()))
+        {
+            sendHttp(exchange, 403, "text/plain; charset=utf-8", "home network only");
+            return;
+        }
+
+        Path newest = newestSave();
+        String name = newest == null ? "" : newest.getFileName().toString().replaceAll("(?i)\\.sav$", "");
+        sendHttp(exchange, newest == null ? 404 : 200, "text/plain; charset=utf-8", name);
+    }
+
     // Zip of the host's newest save (.sav plus its .png/.json), for the joining player's co-op slot.
     private static void handleSaveDownload(HttpExchange exchange) throws IOException
     {
@@ -207,14 +234,7 @@ public class WitcherServer
             return;
         }
 
-        Path newest = null;
-        try (java.util.stream.Stream<Path> files = Files.list(savesDir))
-        {
-            newest = files
-                    .filter(p -> p.getFileName().toString().toLowerCase(Locale.ROOT).endsWith(".sav"))
-                    .max(java.util.Comparator.comparingLong(p -> p.toFile().lastModified()))
-                    .orElse(null);
-        }
+        Path newest = newestSave();
 
         if (newest == null)
         {
@@ -718,6 +738,13 @@ public class WitcherServer
                 current.endpoint = sender;
                 dbg("Updated endpoint for %s from %s to %s\n", username, old, sender);
             }
+            else if (expired && isHomeNetwork(sender.address))
+            {
+                // a home-network player whose address changed (Wi-Fi reconnect, DHCP) takes their name back
+                players.remove(usernameKey, current);
+                reservedUsernames.remove(usernameKey);
+                dbg("%s reconnected from new address %s\n", username, sender);
+            }
             else if (expired)
             {
                 boolean reserved = reserveTimedOutPlayer(usernameKey, current, now);
@@ -760,7 +787,7 @@ public class WitcherServer
 
             if (reservation != null)
             {
-                if (!reservation.ip.equals(senderIp))
+                if (!reservation.ip.equals(senderIp) && !isHomeNetwork(sender.address))
                 {
                     dbg("Rejected username %s from %s because it is reserved for IP %s\n",
                             username, sender, reservation.ip);
