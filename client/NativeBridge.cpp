@@ -77,6 +77,9 @@ namespace wo_native
 	static std::mutex g_stateMutex;
 	static int g_localId = 0;
 	static std::string g_username;
+	static std::string g_hostName;
+	static std::string g_lanRole;
+	static std::string g_autoLoadSave;
 	static std::atomic<bool> g_connected{false};
 
 	// Remastered (5.x) script strings are UTF-8 bytes; Next-Gen (4.x) strings are UTF-16.
@@ -268,6 +271,19 @@ namespace wo_native
 	{
 		std::lock_guard<std::mutex> lock(g_stateMutex);
 		g_username = name;
+	}
+
+	void SetHostName(const std::string &name)
+	{
+		std::lock_guard<std::mutex> lock(g_stateMutex);
+		g_hostName = name;
+	}
+
+	void SetLanInfo(const std::string &role, const std::string &autoLoadSave)
+	{
+		std::lock_guard<std::mutex> lock(g_stateMutex);
+		g_lanRole = role;
+		g_autoLoadSave = autoLoadSave;
 	}
 
 	void SetConnected(bool connected)
@@ -700,6 +716,17 @@ namespace wo_native
 				localId = g_localId;
 			}
 			ReturnString(frame, result, std::to_string(localId));
+			return;
+		}
+		// -6 host name, -7 LAN role, -8 handed-over save
+		if (index == -6 || index == -7 || index == -8)
+		{
+			std::string value;
+			{
+				std::lock_guard<std::mutex> lock(g_stateMutex);
+				value = index == -6 ? g_hostName : (index == -7 ? g_lanRole : g_autoLoadSave);
+			}
+			ReturnString(frame, result, value);
 			return;
 		}
 

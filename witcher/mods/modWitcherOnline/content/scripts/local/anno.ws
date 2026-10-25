@@ -26,7 +26,43 @@ function OnSpawned(spawnData: SEntitySpawnData)
     theGame.r_getMultiplayerClient().WO_PublishPresence(theGame.r_getMultiplayerClient().WO_GetPresence(), true);
 }
 
-@addMethod(CR4Player) 
+// LAN co-op, the player who joins: "Join LAN co-op.cmd" fetched the host's newest save into the co-op profile;
+// load it at the main menu, once per game start (back at the menu later, the player picks a save themselves).
+@addField(CR4Game)
+var r_lanSaveLoadClaimed : bool;
+
+@wrapMethod(CR4CommonMainMenuBase)
+function OnConfigUI()
+{
+    var saves : array<SSavegameInfo>;
+    var wanted : string;
+    var i : int;
+
+    wrappedMethod();
+
+    // straight from the native layer (-8 save name, -7 LAN role): the multiplayer client only starts in game
+    wanted = WO_Str(-8);
+    if(wanted == "" || WO_Str(-7) != "member" || theGame.r_lanSaveLoadClaimed)
+    {
+        return true;
+    }
+    theGame.r_lanSaveLoadClaimed = true;
+
+    theGame.ListSavedGames(saves);
+    for(i = 0; i < saves.Size(); i += 1)
+    {
+        if(StrFindFirst(saves[i].filename, wanted) >= 0)
+        {
+            theGame.LoadGameInit(saves[i], false);
+            return true;
+        }
+    }
+
+    theGame.GetGuiManager().ShowNotification("W3Coop: the host's save '" + wanted + "' is not in the co-op profile; load a save yourself.");
+    return true;
+}
+
+@addMethod(CR4Player)
 timer function r_showUsernameAlert(dt : float, id : int)
 {
     theGame.r_getMultiplayerClient().showUsernameTaken();

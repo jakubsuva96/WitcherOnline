@@ -1581,6 +1581,69 @@ statemachine class r_MultiplayerClient
         return true;
     }
 
+    // ---------------------------------------------------------------- LAN co-op: party, notices, kill switch
+
+    private var autoJoinedHost : string;
+    private var nextAutoPartyCheck : float;
+    private var coopSwitchedOff : bool;
+
+    // The player who joins a LAN game follows the host's party by themselves, once per time the host is there:
+    // leaving the party by hand sticks until the host leaves and comes back.
+    private function checkAutoParty()
+    {
+        var host : string;
+        var now : float;
+
+        now = theGame.GetEngineTimeAsSeconds();
+        if(now < nextAutoPartyCheck)
+        {
+            return;
+        }
+        nextAutoPartyCheck = now + 2;
+
+        host = WO_HostName();
+        if(WO_LanRole() != "member" || coopSwitchedOff || host == "" || host == username || autoJoinedHost == host)
+        {
+            return;
+        }
+        if(inParty && joinedParty == host)
+        {
+            autoJoinedHost = host;
+            return;
+        }
+        if(!getGlobalPlayerByUsername(host))
+        {
+            return;
+        }
+
+        autoJoinedHost = host;
+        joinParty(host);
+    }
+
+    public function coopNotice(text : string)
+    {
+        theGame.GetGuiManager().ShowNotification("W3Coop: " + text);
+    }
+
+    // Ctrl+F9: shared enemies and quest sync off (each world on its own again) and back on; players still see each other
+    public function toggleCoopSwitch()
+    {
+        coopSwitchedOff = !coopSwitchedOff;
+        if(coopSwitchedOff)
+        {
+            coopNotice("shared enemies and quests OFF (Ctrl+F9 turns them back on).");
+        }
+        else
+        {
+            coopNotice("shared enemies and quests ON.");
+        }
+    }
+
+    public function CoopSwitchedOff() : bool
+    {
+        return coopSwitchedOff;
+    }
+
     private function leavePartyBecauseTargetLeft()
     {
         var oldParty : string;
@@ -1589,6 +1652,9 @@ statemachine class r_MultiplayerClient
         {
             return;
         }
+
+        // the host left: when they come back, the auto party joins them again
+        autoJoinedHost = "";
 
         oldParty = joinedParty;
 
@@ -3066,6 +3132,7 @@ statemachine class r_MultiplayerClient
 
         WO_PumpInbound(128);
         setUserId(WO_LocalId(), WO_Username());
+        checkAutoParty();
 
         tickMask = WO_Tick();
         if(tickMask <= 0)
@@ -5541,6 +5608,30 @@ statemachine class r_MultiplayerClient
         return WO_Str(-4);
     }
 
+    // LAN co-op (the LAN launchers write these into config.xml; the server names the host)
+    function WO_HostName() : string
+    {
+        return WO_Str(-6);
+    }
+
+    // "host", "member", or "" outside LAN co-op
+    function WO_LanRole() : string
+    {
+        return WO_Str(-7);
+    }
+
+    // on a LAN, shared state can go out more often and remote players can follow it more tightly
+    function WO_LanSync() : bool
+    {
+        return WO_LanRole() != "";
+    }
+
+    // the host's save "Join LAN co-op.cmd" brought over, loaded once at the main menu
+    function WO_AutoLoadSaveName() : string
+    {
+        return WO_Str(-8);
+    }
+
     function WO_GlobalPlayerByServerId(serverPlayerId : int) : r_RemotePlayer
     {
         var globals : array<r_RemotePlayer>;
@@ -5787,6 +5878,22 @@ statemachine class r_MultiplayerClient
 
                 case 11:
                     client.setVersionMismatch(WO_Str(0), WO_Str(1), WO_Str(2));
+                    break;
+
+                case 12:
+                    client.coopNotice("Lost the connection to the host. Waiting for it to come back...");
+                    break;
+
+                case 13:
+                    client.coopNotice("Connected to the host again.");
+                    break;
+
+                case 14:
+                    client.toggleCoopSwitch();
+                    break;
+
+                case 15:
+                    client.coopNotice("No co-op host found on the network. Start \"Host LAN co-op.cmd\" on the host's PC, or put its address in config.xml.");
                     break;
 
                 default:

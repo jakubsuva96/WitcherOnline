@@ -542,7 +542,8 @@ class r_CoopEnemies
 
         client = theGame.r_getMultiplayerClient();
         localOnly = theGame.GetInGameConfigWrapper().GetVarValue('MPGhosts_Main', 'MPGhosts_LocalEnemiesOnly');
-        if(!client || localOnly)
+        // Ctrl+F9 (the kill switch) works like the menu option: each world on its own again
+        if(!client || localOnly || client.CoopSwitchedOff())
         {
             return 0;
         }
@@ -562,6 +563,15 @@ class r_CoopEnemies
             }
         }
         return 0;
+    }
+
+    private function HostSnapshotInterval(client : r_MultiplayerClient) : float
+    {
+        if(client.WO_LanSync())
+        {
+            return 0.033;
+        }
+        return 0.1;
     }
 
     // called every frame from the client's tick while in game
@@ -588,7 +598,8 @@ class r_CoopEnemies
             {
                 PoseChecks(now);
             }
-            if(CommitDueAttacks(now) || now - lastHostSend >= 0.1)
+            // 10 snapshots a second, 30 on a LAN
+            if(CommitDueAttacks(now) || now - lastHostSend >= HostSnapshotInterval(client))
             {
                 HostCollect(client, now);
                 HostSend();

@@ -1,6 +1,7 @@
 #include "NativeBridge.h"
 #include "crash.h"
 #include "pch.h"
+#include "profile.h"
 
 #include <windows.h>
 
@@ -874,21 +875,83 @@ static void OnWelcome()
 	wo_crash::UploadPending(host, g_crashReportPort, GetLocalUsername());
 }
 
+// Connection watchdog: the server repeats state every 100 ms (33 ms on LAN), so a few seconds of silence means the
+// host is gone or the network dropped. The player is told, and told again when packets come back.
+static constexpr ULONGLONG kConnectionLostMs = 6000;
+static std::atomic<ULONGLONG> g_lastServerPacketTick{0};
+static std::atomic<bool> g_connectionLost{false};
+
+static void CheckConnection()
+{
+	const ULONGLONG last = g_lastServerPacketTick.load();
+	if (!wo_native::IsConnected() || last == 0 || g_connectionLost.load())
+		return;
+
+	if (GetTickCount64() - last > kConnectionLostMs)
+	{
+		g_connectionLost.store(true);
+		wo_native::DebugLog("connection: nothing from the server for " + std::to_string(kConnectionLostMs / 1000) + " s");
+		wo_native::PushControl(wo_native::InboundOpcode::ConnectionLost);
+	}
+}
+
+static void NoteServerPacket()
+{
+	g_lastServerPacketTick.store(GetTickCount64());
+	if (g_connectionLost.exchange(false))
+	{
+		wo_native::DebugLog("connection: the server answers again");
+		wo_native::PushControl(wo_native::InboundOpcode::ConnectionRestored);
+	}
+}
+
+// Co-op kill switch: Ctrl+F9 while the game window is in front. Polled, so no input files of the game change.
+static bool g_killSwitchDown = false;
+
+static void PollKillSwitchHotkey()
+{
+	HWND front = GetForegroundWindow();
+	DWORD pid = 0;
+	if (front)
+		GetWindowThreadProcessId(front, &pid);
+
+	const bool down = pid == GetCurrentProcessId() && (GetAsyncKeyState(VK_CONTROL) & 0x8000) && (GetAsyncKeyState(VK_F9) & 0x8000);
+	if (down && !g_killSwitchDown)
+	{
+		wo_native::DebugLog("kill switch: Ctrl+F9");
+		wo_native::PushControl(wo_native::InboundOpcode::ToggleCoop);
+	}
+	g_killSwitchDown = down;
+}
+
 static void HandleServerPacket(const std::string &msg)
 {
 	auto parts = SplitTabs(msg);
 	if (parts.empty())
 		return;
 
+	NoteServerPacket();
+
+	// "HOST \t username": a server started with --lan names the player on the PC that runs it
+	if (parts[0] == "HOST")
+	{
+		if (parts.size() >= 2)
+			wo_native::SetHostName(parts[1]);
+		return;
+	}
+
 	if (parts[0] == "WELCOME")
 	{
 		if (!g_welcomed.exchange(true))
 		{
 			wo_native::DebugLog("handshake: host runs W3Coop " + (parts.size() >= 2 ? parts[1] : std::string("?")) + ", same as this game");
-			// "WELCOME \t modVersion \t protocol \t crashReportPort" (0: the host takes no crash reports)
+			// "WELCOME \t modVersion \t protocol \t crashReportPort [\t host]" (port 0: the host takes no crash reports;
+			// host: the player on the server's PC, when the server runs with --lan)
 			int crashPort = 0;
 			if (parts.size() >= 4 && ParsePositiveInt(parts[3], crashPort))
 				g_crashReportPort = crashPort;
+			if (parts.size() >= 5 && !parts[4].empty())
+				wo_native::SetHostName(parts[4]);
 			OnWelcome();
 		}
 		return;
@@ -1133,6 +1196,8 @@ static void SenderThread()
 
 		SendHelloIfDue();
 		ReinstallCrashHandlerIfDue();
+		CheckConnection();
+		PollKillSwitchHotkey();
 
 		if (!worked)
 			Sleep(1);
@@ -1317,6 +1382,8 @@ static void initScript()
 	pugi::xml_parse_result result = doc.load_file(fullPath.c_str());
 
 	std::string configuredName;
+	std::string lanRole;
+	std::string autoLoadSave;
 	if (result)
 	{
 		pugi::xml_node xml = doc.child("Config");
@@ -1327,8 +1394,14 @@ static void initScript()
 			port = xml.child("Port").text().as_string();
 			if (xml.child("SendCrashReports"))
 				g_sendCrashReports = xml.child("SendCrashReports").text().as_bool(true);
+			// written by the LAN launchers: "host" or "member", and the save "Join LAN co-op.cmd" brought over
+			lanRole = xml.child("Role").text().as_string();
+			autoLoadSave = xml.child("AutoLoadSave").text().as_string();
 		}
 	}
+	if (lanRole != "host" && lanRole != "member")
+		lanRole.clear();
+	wo_native::SetLanInfo(lanRole, autoLoadSave);
 
 	// the package's default "Player" becomes the Windows account name, so two PCs don't start out with the same name
 	if (configuredName.empty() || configuredName == "Player")
@@ -1351,7 +1424,10 @@ static void initScript()
 	wo_native::InitLog((woDir / logName).string());
 
 	wo_native::DebugLog("startup: W3Coop " + std::string(kModVersion) + " (protocol " + kProtocolVersion + "), game " + g_gameVersion);
-	wo_native::DebugLog("username=" + username + " server=" + ip + ":" + port);
+	wo_native::DebugLog("username=" + username + " server=" + ip + ":" + port + (lanRole.empty() ? "" : " LAN role=" + lanRole) +
+	                    (autoLoadSave.empty() ? "" : " save to load=" + autoLoadSave));
+	if (!wo_profile::Documents().empty())
+		wo_native::DebugLog("co-op profile: Documents -> " + fs::path(wo_profile::Documents()).u8string());
 
 	SetLocalUsername(username);
 
@@ -1372,6 +1448,7 @@ static void initScript()
 		else
 		{
 			ip = "127.0.0.1";
+			wo_native::PushControl(wo_native::InboundOpcode::NoHostFound);
 		}
 	}
 
@@ -1397,6 +1474,8 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
 	{
 	case DLL_PROCESS_ATTACH:
 		DisableThreadLibraryCalls(hModule);
+		// here, not on the init thread: the game may ask for its Documents folder before that thread runs
+		wo_profile::InstallIfConfigured(getExecutablePath() / "WitcherOnline");
 		g_initThread = CreateThread(nullptr, 0, InitThreadProc, nullptr, 0, nullptr);
 		if (g_initThread)
 		{

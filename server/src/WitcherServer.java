@@ -63,6 +63,16 @@ public class WitcherServer
     private static final long HELLO_GRACE_NANOS = 5_000_000_000L;
     private static final AtomicBoolean requireHello = new AtomicBoolean(true);
 
+    // LAN co-op (--lan): state goes out three times as often, and the player whose game runs on this PC is the host,
+    // announced to everyone so the other player's game joins their party by itself
+    private static final long DEFAULT_BROADCAST_INTERVAL_MILLIS = 100;
+    private static final long LAN_BROADCAST_INTERVAL_MILLIS = 33;
+    private static final long HOST_ANNOUNCE_NANOS = 2_000_000_000L;
+    private static volatile boolean lanMode = false;
+    private static volatile long broadcastIntervalMillis = DEFAULT_BROADCAST_INTERVAL_MILLIS;
+    private static volatile String hostName = "";
+    private static volatile Path hostSavesDir = null;
+
     private static final int DEFAULT_PORT = 40000;
     private static final DateTimeFormatter LOG_TIME = DateTimeFormatter.ofPattern("HH:mm:ss");
 
@@ -79,6 +89,20 @@ public class WitcherServer
         int port = choosePort(args, serverProperties);
         whitelistEnabled.set(readBoolean(serverProperties, "whitelist", false));
         requireHello.set(readBoolean(serverProperties, "requireHello", true));
+
+        // "Host LAN co-op.cmd" starts the server with --lan --saves <the host's gamesaves folder>
+        for (int i = 0; i < args.length; i++)
+        {
+            if ("--lan".equals(args[i]))
+            {
+                lanMode = true;
+            }
+            else if ("--saves".equals(args[i]) && i + 1 < args.length)
+            {
+                hostSavesDir = Paths.get(args[++i]);
+            }
+        }
+        broadcastIntervalMillis = lanMode ? LAN_BROADCAST_INTERVAL_MILLIS : DEFAULT_BROADCAST_INTERVAL_MILLIS;
 
         loadBannedIps();
         loadWhitelistIps();
@@ -187,8 +211,104 @@ public class WitcherServer
     {
         HttpServer server = HttpServer.create(new InetSocketAddress(crashPort), 0);
         server.createContext("/crash", WitcherServer::handleCrashReport);
+        server.createContext("/save", WitcherServer::handleSave);
         server.setExecutor(null);
         server.start();
+    }
+
+    private static boolean isLanAddress(java.net.InetAddress remote)
+    {
+        return remote.isLoopbackAddress() || remote.isSiteLocalAddress() || remote.isLinkLocalAddress();
+    }
+
+    // the host's newest save (W3 writes name.sav with a name.png screenshot next to it)
+    private static Path newestHostSave() throws IOException
+    {
+        Path dir = hostSavesDir;
+        if (dir == null || !Files.isDirectory(dir))
+        {
+            return null;
+        }
+
+        try (var files = Files.list(dir))
+        {
+            return files.filter(p -> p.getFileName().toString().toLowerCase(Locale.ROOT).endsWith(".sav") && Files.isRegularFile(p))
+                    .max((a, b) -> {
+                        try
+                        {
+                            return Files.getLastModifiedTime(a).compareTo(Files.getLastModifiedTime(b));
+                        }
+                        catch (IOException e)
+                        {
+                            return 0;
+                        }
+                    })
+                    .orElse(null);
+        }
+    }
+
+    // GET /save/latest/info -> "name.sav \t bytes \t modified (ms)"; GET /save/latest/sav and /save/latest/png -> the
+    // files. "Join LAN co-op.cmd" fetches them so both players start the session from the host's newest save.
+    private static void handleSave(HttpExchange exchange) throws IOException
+    {
+        try
+        {
+            if (!"GET".equals(exchange.getRequestMethod()))
+            {
+                sendHttp(exchange, 405, "text/plain; charset=utf-8", "GET only\n");
+                return;
+            }
+            if (!isLanAddress(exchange.getRemoteAddress().getAddress()))
+            {
+                sendHttp(exchange, 403, "text/plain; charset=utf-8", "LAN only\n");
+                return;
+            }
+
+            Path save = newestHostSave();
+            if (save == null)
+            {
+                sendHttp(exchange, 404, "text/plain; charset=utf-8", "no save to hand over\n");
+                return;
+            }
+
+            String path = exchange.getRequestURI().getPath();
+            if ("/save/latest/info".equals(path))
+            {
+                sendHttp(exchange, 200, "text/plain; charset=utf-8",
+                        save.getFileName() + "\t" + Files.size(save) + "\t" + Files.getLastModifiedTime(save).toMillis() + "\n");
+                return;
+            }
+
+            Path file = null;
+            if ("/save/latest/sav".equals(path))
+            {
+                file = save;
+            }
+            else if ("/save/latest/png".equals(path))
+            {
+                String name = save.getFileName().toString();
+                file = save.resolveSibling(name.substring(0, name.length() - 4) + ".png");
+            }
+
+            if (file == null || !Files.isRegularFile(file))
+            {
+                sendHttp(exchange, 404, "text/plain; charset=utf-8", "not found\n");
+                return;
+            }
+
+            exchange.getResponseHeaders().set("Content-Type", "application/octet-stream");
+            exchange.sendResponseHeaders(200, Files.size(file));
+            try (OutputStream out = exchange.getResponseBody())
+            {
+                Files.copy(file, out);
+            }
+            dbg("Handed over save %s to %s\n", file.getFileName(), exchange.getRemoteAddress());
+        }
+        catch (Exception e)
+        {
+            dbg("Save hand-over failed: %s\n", e.getMessage());
+            sendHttp(exchange, 500, "text/plain; charset=utf-8", "error\n");
+        }
     }
 
     private static String safeFileName(String text)
@@ -940,6 +1060,13 @@ public class WitcherServer
         {
             current.update4Fields = frozenFields;
         }
+
+        if (lanMode)
+        {
+            // on a LAN, new state goes out at once too (as MOVE and COOP do), not only on the next tick
+            int sent = broadcastChunk(socket, snapshotRecipients(), current, opcode, frozenFields);
+            totalPacketsSent.addAndGet(sent);
+        }
     }
 
     private static void evictOldestCoopChannel(PlayerSession session)
@@ -985,8 +1112,8 @@ public class WitcherServer
     private static final Map<String, AcceptedHello> acceptedHellos = new ConcurrentHashMap<>();
     private static final long ACCEPTED_HELLO_HOLD_NANOS = 600_000_000_000L;
 
-    // "DISCOVER \t W3COOP \t protocol", broadcast by a client looking for a host on the LAN;
-    // the answer goes straight back to it: "W3COOP_HOST \t protocol \t modVersion \t port \t players"
+    // "DISCOVER \t W3COOP \t protocol", broadcast by a client looking for a host on the LAN; the answer goes straight
+    // back to it: "W3COOP_HOST \t protocol \t modVersion \t port \t players \t crash report / save port (0: none)"
     private static void handleDiscover(DatagramSocket socket, ClientEndpoint sender, String[] parts)
     {
         if (parts.length < 2 || !"W3COOP".equals(parts[1]))
@@ -994,7 +1121,8 @@ public class WitcherServer
             return;
         }
 
-        safeSend(socket, sender, "W3COOP_HOST\t" + PROTOCOL_VERSION + "\t" + MOD_VERSION + "\t" + socket.getLocalPort() + "\t" + players.size());
+        safeSend(socket, sender, "W3COOP_HOST\t" + PROTOCOL_VERSION + "\t" + MOD_VERSION + "\t" + socket.getLocalPort() + "\t" + players.size()
+                + "\t" + crashReportPort);
     }
 
     // "HELLO \t username \t protocol \t modVersion \t gameVersion": answered with WELCOME or an ERROR that says what
@@ -1061,8 +1189,25 @@ public class WitcherServer
             applyAcceptedHello(usernameKey, owner, senderIp);
         }
 
-        // the last field tells the client where to send crash reports (0: not collected)
-        safeSend(socket, sender, "WELCOME\t" + MOD_VERSION + "\t" + PROTOCOL_VERSION + "\t" + crashReportPort);
+        // on a LAN server, the game on this PC is the host's (the Steam relay also connects from loopback, so only
+        // with --lan); a new one takes over when the old host has no session any more
+        if (lanMode && sender.address.isLoopbackAddress())
+        {
+            String current = hostName;
+            boolean currentGone = current.isEmpty() || !players.containsKey(normalizeUsernameKey(current));
+            if (currentGone && !username.equals(current))
+            {
+                hostName = username;
+                dbg("LAN host: %s\n", username);
+                for (ClientEndpoint recipient : snapshotRecipients())
+                {
+                    safeSend(socket, recipient, "HOST\t" + escapeField(username));
+                }
+            }
+        }
+
+        // where to send crash reports (0: not collected), and who hosts (LAN only)
+        safeSend(socket, sender, "WELCOME\t" + MOD_VERSION + "\t" + PROTOCOL_VERSION + "\t" + crashReportPort + "\t" + escapeField(hostName));
     }
 
     private static void applyAcceptedHello(String usernameKey, PlayerSession session, String senderIp)
@@ -1163,11 +1308,13 @@ public class WitcherServer
     private static void broadcastLoop(DatagramSocket socket)
     {
         long lastHeartbeat = System.nanoTime();
+        long lastHostAnnounce = 0L;
 
         while (running.get())
         {
             try
             {
+                long tickStart = System.nanoTime();
                 List<ClientEndpoint> recipients = snapshotRecipients();
                 int packetsSentThisTick = 0;
 
@@ -1217,7 +1364,19 @@ public class WitcherServer
                     lastHeartbeat = now;
                 }
 
-                Thread.sleep(100);
+                if (lanMode && !hostName.isEmpty() && now - lastHostAnnounce >= HOST_ANNOUNCE_NANOS)
+                {
+                    // repeated: a member whose first one was lost still learns who hosts
+                    for (ClientEndpoint recipient : recipients)
+                    {
+                        safeSend(socket, recipient, "HOST\t" + escapeField(hostName));
+                    }
+                    lastHostAnnounce = now;
+                }
+
+                // the interval counts from the tick's start: sending to every player takes a few ms of its own
+                long spentMillis = (System.nanoTime() - tickStart) / 1_000_000L;
+                Thread.sleep(Math.max(1L, broadcastIntervalMillis - spentMillis));
             }
             catch (InterruptedException e)
             {
