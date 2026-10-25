@@ -109,6 +109,8 @@ statemachine class r_RemotePlayer
     public var castSignType : ESignType;
     public var castYrdenRange : float;
     public var castYrdenDuration : float;
+    private var placedYrdenRange : float;
+    private var placedYrdenDuration : float;
     public var castQuenLevel : int;
     public var quenBurstSeq : int;
     public var quenImpulseSeq : int;
@@ -931,8 +933,7 @@ statemachine class r_RemotePlayer
 
         chatOneliner.text = (new MP_SUOL_TagBuilder in theInput)
         .tag("font")
-        .attr("size", "20")
-        .attr("color", "#ffffff")
+        .attr("size", WO_ChatFontSize())
         .text(msg);
 
         MP_SUOL_getManager().updateOneliner(chatOneliner);
@@ -1704,11 +1705,12 @@ statemachine class r_RemotePlayer
             chatOneliner.visible = true;
             prevChatTime = lastChatTime;
             chatShownAt = theGame.GetEngineTimeAsSeconds();
+            WO_ChatLog(username, lastChat);
         }
 
         if (chatOneliner && chatOneliner.visible && chatShownAt >= 0.0f)
         {
-            if ((theGame.GetEngineTimeAsSeconds() - chatShownAt) > 12.0f)
+            if ((theGame.GetEngineTimeAsSeconds() - chatShownAt) > WO_ChatDuration(lastChat))
             {
                 chatOneliner.visible = false;
                 chatShownAt = -1.0f;
@@ -2951,6 +2953,12 @@ statemachine class r_RemotePlayer
             second = yrden.effects[0].castEffect;
             lasting = 10.0;
             PlaceYrdenRunes(yrden);
+            // as leader, the member's trap also works here (wraiths, slowing) for its real duration
+            if(theGame.r_getMultiplayerClient().getCoopEnemies().GetRole() == 1)
+            {
+                lasting = placedYrdenDuration + 0.5;
+                theGame.r_getMultiplayerClient().getCoopParty().AddYrdenZone(yrden, ghost, placedYrdenRange, placedYrdenDuration);
+            }
         }
         coop = theGame.r_getMultiplayerClient().getCoopEnemies();
         coop.signVisualsPlayed += 1;
@@ -3144,6 +3152,8 @@ statemachine class r_RemotePlayer
             duration = 10;
         }
         yrdenRunesUntil = theGame.GetEngineTimeAsSeconds() + duration;
+        placedYrdenRange = range;
+        placedYrdenDuration = duration;
         center = yrden.GetWorldPosition();
         for(i = 0; i < yrden.runeTemplates.Size(); i += 1)
         {
@@ -7077,9 +7087,11 @@ state WO_UpdateCPC in r_RemotePlayer
 
                 if(parent.cpcPlayerType == ENR_PlayerCiri)
                 {
-                    // nr_h_01_wa__ciri came from Custom Player Characters, which the Remastered port doesn't ship
-                    parent.cpcHeadTemp = updateTemplate("characters/models/main_npc/ciri/h_01_wa__ciri.w2ent", parent.cpcHeadTemp);
+                    // nr_h_01_wa__ciri came from Custom Player Characters, which the Remastered port doesn't ship.
+                    // The synced (Geralt) head may already be on the new ghost: take it off first.
                     parent.headOverride = true;
+                    parent.EquipNewItem(parent.ghost.GetInventory(), parent.last_eq_head, '');
+                    parent.cpcHeadTemp = updateTemplate("characters/models/main_npc/ciri/h_01_wa__ciri.w2ent", parent.cpcHeadTemp);
                     
                     parent.unmountHair();
                     parent.hideHair = true;

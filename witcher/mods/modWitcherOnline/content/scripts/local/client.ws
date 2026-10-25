@@ -3172,6 +3172,7 @@ statemachine class r_MultiplayerClient
         ridingPlayer = NULL;
         ridingEnabled = false;
         theInput.RegisterListener( this, 'OnEmoteMenu', 'WO_Emote' );
+        theInput.RegisterListener( this, 'OnChatInput', 'WO_Chat' );
 
         if(this.GetCurrentStateName() != 'WO_Tick')
         {
@@ -3535,8 +3536,7 @@ statemachine class r_MultiplayerClient
         {
             chatOneliner.text = (new MP_SUOL_TagBuilder in theInput)
             .tag("font")
-            .attr("size", "20")
-            .attr("color", "#ffffff")
+            .attr("size", WO_ChatFontSize())
             .text(msg);
 
             chatOneliner.visible = true;
@@ -3548,8 +3548,7 @@ statemachine class r_MultiplayerClient
         chatOneliner = new MP_SU_OnelinerEntity in theInput;
         chatOneliner.text = (new MP_SUOL_TagBuilder in theInput)
         .tag("font")
-        .attr("size", "20")
-        .attr("color", "#ffffff")
+        .attr("size", WO_ChatFontSize())
         .text(msg);
 
         chatOneliner.visible = true;
@@ -3578,7 +3577,7 @@ statemachine class r_MultiplayerClient
             prevChatTime = lastChatTime;
         }
 
-        if((theGame.GetEngineTimeAsSeconds() - lastChatTime) > 12)
+        if((theGame.GetEngineTimeAsSeconds() - lastChatTime) > WO_ChatDuration(lastChat))
         {
             if(chatOneliner && chatOneliner.visible)
             {
@@ -4900,7 +4899,9 @@ statemachine class r_MultiplayerClient
                 }
             }
 
-            if(!theGame.IsDialogOrCutscenePlaying() && (players[i].menuStatusActive || theGame.GetInGameConfigWrapper().GetVarValue('MPGhosts_Main', 'MPGhosts_GhostEffect')))
+            // see-through also while the player can't act (watching, down, reloading the leader's save)
+            if(!theGame.IsDialogOrCutscenePlaying() && (players[i].menuStatusActive || theGame.GetInGameConfigWrapper().GetVarValue('MPGhosts_Main', 'MPGhosts_GhostEffect')
+                || getCoopParty().ShowsAsInactive(players[i].username)))
             {
                 if(!players[i].ghost.IsEffectActive('invisible'))
                 {
@@ -5304,8 +5305,22 @@ statemachine class r_MultiplayerClient
 		if( IsPressed( action ) )
 		{
             emoteMenu();
-        }	
+        }
 	}
+
+    private var chatInput : r_ChatInput;
+
+    event OnChatInput( action : SInputAction )
+    {
+        if( IsPressed( action ) )
+        {
+            if(!chatInput)
+            {
+                chatInput = new r_ChatInput in this;
+            }
+            chatInput.Open();
+        }
+    }
 
     function getEmoteInventory() : CInventoryComponent
     {
@@ -7458,13 +7473,11 @@ function mpghosts_emote(num : int)
 
 function mpghosts_chat(msg : string)
 {
-    if (StrLen(msg) > 65)
-    {
-        msg = StrLeft(msg, 65);
-    }
+    msg = WO_ChatClean(msg);
 
     theGame.r_getMultiplayerClient().setChat(msg);
     theGame.r_getMultiplayerClient().setLastChatTime(theGame.GetEngineTimeAsSeconds());
+    WO_ChatLog(theGame.r_getMultiplayerClient().getUsername(), msg);
 }
 
 exec function chat(msg : string) 

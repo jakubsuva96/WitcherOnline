@@ -21,6 +21,26 @@ function WO_RemoveCoopSlowdowns()
     theGame.RemoveTimeScale('CiriPhantom');
 }
 
+// The Esc menu pauses the world, which in co-op freezes the shared monsters for the other player too. The pause comes
+// from the menu definition (not from script), so its reason isn't known for sure: every likely one is released.
+// Releasing a reason that isn't held does nothing.
+@wrapMethod(CR4CommonIngameMenu)
+function OnConfigUI()
+{
+    wrappedMethod();
+    if(theGame.r_getMultiplayerClient() && theGame.r_getMultiplayerClient().getCoopEnemies().GetRole() != 0)
+    {
+        theGame.Unpause("CommonIngameMenu");
+        theGame.Unpause("IngameMenu");
+        theGame.Unpause("menus");
+        theGame.Unpause("Menu");
+        theGame.Unpause("menu");
+        theGame.Unpause("GUI");
+        theGame.Unpause("gui");
+        theGame.Unpause("UI");
+    }
+}
+
 // The wheel opens on input, between ticks; strip its slow motion right away so it never shows for a frame.
 @wrapMethod(CR4HudModuleRadialMenu)
 function ShowRadialMenu()

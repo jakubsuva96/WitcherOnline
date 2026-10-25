@@ -46,8 +46,35 @@ function CoopFieldValue(text : string) : string
     return text;
 }
 
+// A member's Yrden on the leader: the drawn trap gets a working area, so the leader's real monsters (wraiths above
+// all) see it as Yrden. Vanilla sends EntersYrden/LeavesYrden and a short slowdown from the trap's own area.
+class r_CoopYrdenZone
+{
+    public var trap : W3YrdenEntity;
+    public var caster : CActor;
+    public var center : Vector;
+    public var range : float;
+    public var until : float;
+    public var inside : array<CNewNPC>;
+    public var grounded : array<CNewNPC>;
+    public var slow : SCustomEffectParams;
+}
+
 class r_CoopParty
 {
+    private var yrdenZones : array<r_CoopYrdenZone>;
+    private var lastYrdenTickAt : float;
+    private var profile : r_CoopProfile;
+
+    public function GetProfile() : r_CoopProfile
+    {
+        if(!profile)
+        {
+            profile = new r_CoopProfile in this;
+        }
+        return profile;
+    }
+
     // leader's own state
     private var ftSeq : int;
     private var ftPin : name;
@@ -91,6 +118,9 @@ class r_CoopParty
     private var partnerKnown : bool;
     private var partnerSession : int;
     private var partnerReviveSeq : int;
+    private var reviveProgress : float;
+    private var lastReviveTickAt : float;
+    private var calmSince : float;
 
     // leader: deaths and the save the member resyncs from
     private var deathSeq : int;
@@ -105,7 +135,39 @@ class r_CoopParty
     private var aggroPos : Vector;
     private var memberAggroSeq : int;
 
+    // checkpoints: at key quest points the leader saves and the member loads that save, so the member's quest graph
+    // can't hang on a scene, trigger or interaction it never got (facts only move it forward)
+    private var checkpointSeq : int;
+    private var checkpointPending : bool;
+    private var checkpointRequestedAt : float;
+    private var checkpointTries : int;
+    private var lastArea : int;
+    private var lastFastTravelAt : float;
+    private var sessionStartAt : float;
+    private var areaChecked : bool;
+    private var wasCiri : bool;
+    private var leaderCheckpointSeq : int;
+    private var leaderCheckpointPending : bool;
+    private var leaderIsCiri : bool;
+    private var leaderInMinigame : bool;
+    private var pendingResync : bool;
+    private var resyncSince : float;
+    private var nextResyncTryAt : float;
+    private var spectating : bool;
+    private var postTeleportUntil : float;
+    private var leaderWasInScene : bool;
+
+    // see-through look while a player can't act
+    private var partnerInactive : bool;
+    private var lookInactive : bool;
+
+    // quest items the leader picked up, mirrored to the member (item-gated quest steps)
+    private var questItemSeq : int;
+    private var questItems : array<string>;
+    private var leaderQuestItemSeq : int;
+
     default farSince = -1;
+    default lastFastTravelAt = -999;
 
     public function Role() : int
     {
@@ -176,6 +238,163 @@ class r_CoopParty
             LeaveMemberState();
         }
         DownedTick(role, now);
+        YrdenTick(now);
+        GetProfile().Tick();
+        UpdateInactiveLook(role);
+    }
+
+    private function IsInactive() : bool
+    {
+        return downed || spectating || pendingResync;
+    }
+
+    // the partner's ghost goes see-through (client.ws, the 'invisible' effect) while the partner can't act
+    public function ShowsAsInactive(username : string) : bool
+    {
+        return username == partnerName && (partnerDowned || partnerInactive);
+    }
+
+    // and this player's own character too, where the character's template has that effect
+    private function UpdateInactiveLook(role : int)
+    {
+        var inactive : bool;
+
+        inactive = role != 0 && IsInactive();
+        if(inactive == lookInactive)
+        {
+            return;
+        }
+        lookInactive = inactive;
+        if(inactive)
+        {
+            thePlayer.PlayEffect('invisible');
+        }
+        else
+        {
+            thePlayer.StopEffect('invisible');
+        }
+    }
+
+    // ---------------------------------------------------------------- member Yrden on the leader
+
+    public function AddYrdenZone(trap : W3YrdenEntity, caster : CActor, range : float, duration : float)
+    {
+        var zone : r_CoopYrdenZone;
+        var minSlow, maxSlow : float;
+
+        if(!trap || !caster || Role() != 1)
+        {
+            return;
+        }
+
+        zone = new r_CoopYrdenZone in this;
+        zone.trap = trap;
+        zone.caster = caster;
+        zone.center = trap.GetWorldPosition();
+        zone.range = range;
+        zone.until = theGame.GetEngineTimeAsSeconds() + duration;
+
+        zone.slow.effectType = EET_Slowdown;
+        if(trap.actionBuffs.Size() > 0)
+        {
+            zone.slow.effectType = trap.actionBuffs[0].effectType;
+            zone.slow.customAbilityName = trap.actionBuffs[0].effectAbilityName;
+        }
+        zone.slow.creator = caster;
+        zone.slow.sourceName = "yrden_mode0";
+        zone.slow.isSignEffect = true;
+        zone.slow.duration = 0.3;
+        minSlow = CalculateAttributeValue(thePlayer.GetSkillAttributeValue(S_Magic_3, 'min_slowdown', false, true));
+        maxSlow = CalculateAttributeValue(thePlayer.GetSkillAttributeValue(S_Magic_3, 'max_slowdown', false, true));
+        zone.slow.effectValue.valueAdditive = (minSlow + maxSlow) / 2;
+
+        theGame.GetBehTreeReactionManager().CreateReactionEvent(trap, 'YrdenCreated', duration, 30, 0.1f, 999, true);
+        yrdenZones.PushBack(zone);
+    }
+
+    private function YrdenTick(now : float)
+    {
+        var entities : array<CGameplayEntity>;
+        var current : array<CNewNPC>;
+        var zone : r_CoopYrdenZone;
+        var npc : CNewNPC;
+        var expired : bool;
+        var i, j : int;
+
+        if(yrdenZones.Size() == 0 || now - lastYrdenTickAt < 0.2)
+        {
+            return;
+        }
+        lastYrdenTickAt = now;
+
+        for(i = yrdenZones.Size() - 1; i >= 0; i -= 1)
+        {
+            zone = yrdenZones[i];
+            expired = now >= zone.until || !zone.trap || !zone.caster;
+
+            current.Clear();
+            if(!expired)
+            {
+                entities.Clear();
+                FindGameplayEntitiesInSphere(entities, zone.center, zone.range, 32, '', FLAG_Attitude_Hostile + FLAG_OnlyAliveActors, zone.caster);
+                for(j = 0; j < entities.Size(); j += 1)
+                {
+                    npc = (CNewNPC)entities[j];
+                    if(npc && !npc.HasTag('MPEntity'))
+                    {
+                        current.PushBack(npc);
+                    }
+                }
+            }
+
+            for(j = zone.inside.Size() - 1; j >= 0; j -= 1)
+            {
+                if(!current.Contains(zone.inside[j]))
+                {
+                    LeaveYrden(zone, zone.inside[j]);
+                    zone.inside.Erase(j);
+                }
+            }
+
+            for(j = 0; j < current.Size(); j += 1)
+            {
+                npc = current[j];
+                if(!zone.inside.Contains(npc))
+                {
+                    zone.inside.PushBack(npc);
+                    npc.SignalGameplayEventParamObject('EntersYrden', zone.trap);
+                }
+                // flyers are pulled down once they touch the ground, as by the real trap
+                if(!npc.IsFlying() && !zone.grounded.Contains(npc))
+                {
+                    npc.BlockAbility('Flying', true);
+                    zone.grounded.PushBack(npc);
+                }
+                npc.AddEffectCustom(zone.slow);
+            }
+
+            if(expired)
+            {
+                yrdenZones.Erase(i);
+            }
+        }
+    }
+
+    private function LeaveYrden(zone : r_CoopYrdenZone, npc : CNewNPC)
+    {
+        if(!npc)
+        {
+            return;
+        }
+        if(zone.trap)
+        {
+            npc.SignalGameplayEventParamObject('LeavesYrden', zone.trap);
+        }
+        if(zone.grounded.Contains(npc))
+        {
+            npc.BlockAbility('Flying', false);
+            zone.grounded.Remove(npc);
+        }
     }
 
     // after every load (the client survives loads, the world doesn't)
@@ -190,7 +409,127 @@ class r_CoopParty
         leaderKnown = false;
         lastSentState = "";
         lastMemberStateSent = "";
+        sessionStartAt = theGame.GetEngineTimeAsSeconds();
+        areaChecked = false;
+        pendingResync = false;
+        spectating = false;
         RefreshNewestSave();
+        GetProfile().OnSessionStart();
+    }
+
+    // ---------------------------------------------------------------- checkpoints (leader)
+
+    private function RequestCheckpoint(reason : string)
+    {
+        if(Role() != 1 || checkpointPending)
+        {
+            return;
+        }
+        checkpointPending = true;
+        checkpointRequestedAt = theGame.GetEngineTimeAsSeconds();
+        checkpointTries = 1;
+        theGame.RequestAutoSave("w3coop " + reason, true);
+    }
+
+    // a new world reached by quest (boat, portal, scene), a Ciri segment over, or a story quest done
+    private function CheckpointTick(now : float)
+    {
+        var area : int;
+
+        if(!areaChecked && now - sessionStartAt > 5.0)
+        {
+            areaChecked = true;
+            area = WO_CurrentAreaCode();
+            if(lastArea != 0 && area != lastArea && now - lastFastTravelAt > 120.0)
+            {
+                RequestCheckpoint("world");
+            }
+            lastArea = area;
+        }
+
+        if(wasCiri && !thePlayer.IsCiri())
+        {
+            RequestCheckpoint("ciri");
+        }
+        wasCiri = thePlayer.IsCiri();
+
+        // saving can be refused (combat, scenes): ask again, and give up rather than hold the member forever
+        if(checkpointPending && now - checkpointRequestedAt > 30.0)
+        {
+            checkpointTries += 1;
+            checkpointRequestedAt = now;
+            if(checkpointTries > 3)
+            {
+                checkpointPending = false;
+            }
+            else
+            {
+                theGame.RequestAutoSave("w3coop retry", true);
+            }
+        }
+    }
+
+    public function OnLocalQuestEvent(journalQuest : CJournalQuest)
+    {
+        if(Role() == 1 && journalQuest && journalQuest.GetType() == Story
+            && theGame.GetJournalManager().GetEntryStatus(journalQuest) == JS_Success)
+        {
+            RequestCheckpoint("quest");
+        }
+    }
+
+    // the leader's game reports the save done; a requested checkpoint becomes the member's next load
+    private function CheckpointSaved()
+    {
+        if(checkpointPending)
+        {
+            checkpointPending = false;
+            checkpointSeq += 1;
+        }
+    }
+
+    // quest items the leader gets go to the member too (last few, by name)
+    public function OnLocalItemGiven(data : SItemChangedData)
+    {
+        var inv : CInventoryComponent;
+        var itemName : string;
+
+        if(Role() != 1 || data.ids.Size() == 0)
+        {
+            return;
+        }
+        inv = thePlayer.GetInventory();
+        if(!inv.IsItemQuest(data.ids[0]))
+        {
+            return;
+        }
+        itemName = NameToString(data.itemName);
+        if(questItems.Contains(itemName))
+        {
+            questItems.Remove(itemName);
+        }
+        questItems.PushBack(itemName);
+        if(questItems.Size() > 6)
+        {
+            questItems.Erase(0);
+        }
+        questItemSeq += 1;
+    }
+
+    private function QuestItemsField() : string
+    {
+        var text : string;
+        var i : int;
+
+        for(i = 0; i < questItems.Size(); i += 1)
+        {
+            if(i > 0)
+            {
+                text += "|";
+            }
+            text += questItems[i];
+        }
+        return CoopField(text);
     }
 
     // ---------------------------------------------------------------- leader
@@ -206,9 +545,13 @@ class r_CoopParty
             scene = 1;
         }
 
+        CheckpointTick(now);
+
         stateText = "coop ps " + ftSeq + " " + CoopField(NameToString(ftPin)) + " " + CoopField(NameToString(ftArea))
             + " " + scene + " " + medSeq + " " + FloatToStringPrec(medTime, 0) + " " + sessionId + " " + CoopBit(downed)
-            + " " + reviveSeq + " " + deathSeq + " " + CoopField(newestSave);
+            + " " + reviveSeq + " " + deathSeq + " " + CoopField(newestSave) + " " + checkpointSeq + " "
+            + CoopBit(checkpointPending) + " " + CoopBit(thePlayer.IsCiri()) + " " + CoopBit(thePlayer.IsInFistFightMiniGame())
+            + " " + questItemSeq + " " + QuestItemsField();
 
         if(stateText != lastSentState || now - lastStateSentAt > 2.0)
         {
@@ -227,6 +570,7 @@ class r_CoopParty
         ftSeq += 1;
         ftPin = pinTag;
         ftArea = areaID;
+        lastFastTravelAt = theGame.GetEngineTimeAsSeconds();
     }
 
     public function OnLocalMeditationRestored(simulatedTime : float)
@@ -244,8 +588,10 @@ class r_CoopParty
     // "ps ftSeq ftPin ftArea scene medSeq medTime session downed reviveSeq deathSeq save"
     public function OnLeaderState(sender : string, count : int)
     {
-        var newFtSeq, newMedSeq, newSession, newReviveSeq, newDeathSeq : int;
+        var newFtSeq, newMedSeq, newSession, newReviveSeq, newDeathSeq, newCheckpointSeq, newQuestItemSeq : int;
+        var now : float;
 
+        now = theGame.GetEngineTimeAsSeconds();
         if(count < 11 || Role() != 2 || sender != LeaderName())
         {
             return;
@@ -281,6 +627,31 @@ class r_CoopParty
         }
         leaderDeathSeq = newDeathSeq;
 
+        if(count >= 17)
+        {
+            newCheckpointSeq = StringToInt(WO_Str(12), 0);
+            leaderCheckpointPending = WO_Str(13) == "1";
+            leaderIsCiri = WO_Str(14) == "1";
+            leaderInMinigame = WO_Str(15) == "1";
+            newQuestItemSeq = StringToInt(WO_Str(16), 0);
+
+            if(leaderKnown && newCheckpointSeq != leaderCheckpointSeq)
+            {
+                pendingResync = true;
+                resyncSince = now;
+                nextResyncTryAt = now + 3.0;
+                Note(sender + " prošel klíčovým bodem příběhu. Načtu jeho hru, jakmile nebudeš v boji ani ve scéně.");
+            }
+            leaderCheckpointSeq = newCheckpointSeq;
+
+            // also on the first state: items the leader has and this world lacks are added
+            if(newQuestItemSeq != leaderQuestItemSeq || !leaderKnown)
+            {
+                MirrorQuestItems(CoopFieldValue(WO_Str(17)));
+            }
+            leaderQuestItemSeq = newQuestItemSeq;
+        }
+
         // the first state only tells where the counters stand; nothing that happened before joining is replayed
         if(leaderKnown && newFtSeq != leaderFtSeq && CoopFieldValue(WO_Str(2)) != "")
         {
@@ -299,6 +670,76 @@ class r_CoopParty
         leaderKnown = true;
     }
 
+    private function MirrorQuestItems(list : string)
+    {
+        var names : array<string>;
+        var inv : CInventoryComponent;
+        var i : int;
+
+        if(list == "")
+        {
+            return;
+        }
+        inv = thePlayer.GetInventory();
+        names = WO_ProfileSplit(list, "|");
+        for(i = 0; i < names.Size(); i += 1)
+        {
+            if(names[i] != "" && inv.GetItemQuantityByName(WO_ToName(names[i])) == 0)
+            {
+                inv.AddAnItem(WO_ToName(names[i]), 1);
+            }
+        }
+    }
+
+    // While the leader plays someone else (Ciri) or a minigame (fistfight), the member only watches: can't be hurt,
+    // isn't pulled along, and gets the leader's save once the leader is back.
+    private function Spectate(myScene : bool)
+    {
+        var should : bool;
+
+        should = leaderIsCiri || leaderInMinigame;
+        if(should && !spectating)
+        {
+            spectating = true;
+            thePlayer.SetImmortalityMode(AIM_Invulnerable, AIC_Scene);
+            if(leaderIsCiri)
+            {
+                Note(LeaderName() + " teď hraje za Ciri. Přihlížíš, po jejím úseku se načte jeho hra.");
+            }
+            else
+            {
+                Note(LeaderName() + " je v pěstním souboji. Přihlížíš.");
+            }
+        }
+        else if(!should && spectating)
+        {
+            spectating = false;
+            if(!myScene && !sceneProtected)
+            {
+                thePlayer.SetImmortalityMode(AIM_None, AIC_Scene);
+            }
+        }
+    }
+
+    private function ResyncTick(now : float, myScene : bool)
+    {
+        if(!pendingResync || now < nextResyncTryAt || myScene || downed || thePlayer.IsInCombat())
+        {
+            return;
+        }
+        if(Resync(true))
+        {
+            pendingResync = false;
+            return;
+        }
+        nextResyncTryAt = now + 5.0;
+        if(now - resyncSince > 120.0)
+        {
+            pendingResync = false;
+            Note("hru hosta se nepodařilo načíst. Napiš do konzole resync, až bude jeho uložená hra u tebe.");
+        }
+    }
+
     private function MemberTick(now : float)
     {
         var gp : r_RemotePlayer;
@@ -315,7 +756,16 @@ class r_CoopParty
         myScene = InScene();
         gp = LeaderGlobal();
 
+        Spectate(myScene);
+        ResyncTick(now, myScene);
         FollowScene(gp, myScene);
+
+        // the leader's scene may have moved the leader (scene teleports): follow at once instead of in 10 s
+        if(leaderWasInScene && !leaderInScene && farSince < 0)
+        {
+            farSince = now - COOP_LEASH_DELAY() + 1.0;
+        }
+        leaderWasInScene = leaderInScene;
 
         if(pendingFt && !myScene && !theGame.r_getMultiplayerClient().WO_GetTeleporting())
         {
@@ -387,9 +837,13 @@ class r_CoopParty
     private function Leash(gp : r_RemotePlayer, myScene : bool, now : float)
     {
         var dist : float;
+        var myPos : Vector;
 
+        // no pulling while: a scene runs, the leader is mid-load/checkpoint, the member watches or reloads, or the
+        // leader is on a boat or in water (the target would be the sea)
         if(!gp || myScene || leaderInScene || now < nextFollowAt || theGame.r_getMultiplayerClient().WO_GetTeleporting()
-            || now - gp.lastUpdate > 3.0)
+            || now - gp.lastUpdate > 3.0 || leaderCheckpointPending || pendingResync || spectating || gp.isSailing
+            || gp.isSwimming)
         {
             farSince = -1;
             return;
@@ -411,8 +865,10 @@ class r_CoopParty
             return;
         }
 
-        dist = VecDistance(thePlayer.GetWorldPosition(), gp.pos);
-        if(dist <= COOP_LEASH_RANGE())
+        myPos = thePlayer.GetWorldPosition();
+        dist = VecDistance(myPos, gp.pos);
+        // a big height difference means another floor, a cellar or a cave, where walking over may be impossible
+        if(dist <= COOP_LEASH_RANGE() && !(dist > 12.0 && AbsF(myPos.Z - gp.pos.Z) > 6.0))
         {
             farSince = -1;
             return;
@@ -421,8 +877,7 @@ class r_CoopParty
         if(farSince < 0)
         {
             farSince = now;
-            Note("jsi od hráče " + LeaderName() + " dál než " + FloatToStringPrec(COOP_LEASH_RANGE(), 0) + " m, za "
-                + FloatToStringPrec(COOP_LEASH_DELAY(), 0) + " s tě k němu přenesu.");
+            Note("jsi daleko od hráče " + LeaderName() + ", za " + FloatToStringPrec(COOP_LEASH_DELAY(), 0) + " s tě k němu přenesu.");
         }
         else if(now - farSince >= COOP_LEASH_DELAY())
         {
@@ -450,6 +905,25 @@ class r_CoopParty
         {
             thePlayer.Teleport(target);
         }
+
+        // a moment to get one's bearings in the middle of the leader's fight
+        if(!downed)
+        {
+            postTeleportUntil = theGame.GetEngineTimeAsSeconds() + 3.0;
+            thePlayer.SetImmortalityMode(AIM_Invulnerable, AIC_Cheat);
+        }
+    }
+
+    // `kjakubovi` / `tohost`: the member to the leader right now
+    public function GoToLeader()
+    {
+        if(!IsMember())
+        {
+            Note("nejsi v partě s hostem.");
+            return;
+        }
+        mpghosts_teleport(LeaderName());
+        nextFollowAt = theGame.GetEngineTimeAsSeconds() + 5.0;
     }
 
     private function LeaveMemberState()
@@ -472,7 +946,7 @@ class r_CoopParty
 
         stateText = "coop ms " + sessionId + " " + CoopBit(downed) + " " + reviveSeq + " " + aggroSeq + " "
             + CoopField(aggroTpl) + " " + FloatToStringPrec(aggroPos.X, 1) + " " + FloatToStringPrec(aggroPos.Y, 1) + " "
-            + FloatToStringPrec(aggroPos.Z, 1);
+            + FloatToStringPrec(aggroPos.Z, 1) + " " + CoopBit(IsInactive());
 
         if(stateText != lastMemberStateSent || now - lastMemberStateSentAt > 2.0)
         {
@@ -513,6 +987,7 @@ class r_CoopParty
         newAggroSeq = StringToInt(WO_Str(4), 0);
         partnerName = sender;
         SetPartnerDowned(WO_Str(2) == "1");
+        partnerInactive = count >= 9 && WO_Str(9) == "1";
 
         if(newSession != partnerSession)
         {
@@ -572,11 +1047,17 @@ class r_CoopParty
 
         if(!downed)
         {
-            if(!thePlayer.IsImmortalityModeSetByChannel(AIM_Immortal, AIC_Cheat))
+            // after a leash teleport the channel holds a short invulnerability instead
+            if(now >= postTeleportUntil && !thePlayer.IsImmortalityModeSetByChannel(AIM_Immortal, AIC_Cheat))
             {
                 thePlayer.SetImmortalityMode(AIM_Immortal, AIC_Cheat);
             }
             immortalSet = true;
+
+            if(partnerDowned)
+            {
+                ProximityRevive(now);
+            }
 
             // fistfights knock out through their own unconscious mode; scenes may set health themselves
             if(thePlayer.GetStatMax(BCS_Vitality) > 0 && thePlayer.GetStat(BCS_Vitality) <= 1.5
@@ -587,23 +1068,84 @@ class r_CoopParty
             return;
         }
 
-        if(now - downedAt >= COOP_DOWNED_TIME() || (role == 1 && partnerDowned))
+        // only both down ends it; otherwise the partner comes, or the fight ends and this player gets up
+        if(role == 1 && partnerDowned)
         {
             DownedExpired(role);
+            return;
+        }
+        if(NoHostilesNear())
+        {
+            if(calmSince < 0)
+            {
+                calmSince = now;
+            }
+            else if(now - calmSince >= 5.0)
+            {
+                ReviveSelf(0.3);
+                Note("boj skončil, vstáváš.");
+            }
+        }
+        else
+        {
+            calmSince = -1;
+        }
+    }
+
+    private function NoHostilesNear() : bool
+    {
+        var actors : array<CActor>;
+
+        actors = thePlayer.GetNPCsAndPlayersInRange(25, 4, '', FLAG_Attitude_Hostile + FLAG_OnlyAliveActors + FLAG_ExcludePlayer);
+        return actors.Size() == 0;
+    }
+
+    // The game blocks Interact during combat, so standing next to the downed partner for 3 s revives them too.
+    private function ProximityRevive(now : float)
+    {
+        var rp : r_RemotePlayer;
+        var dt : float;
+
+        dt = now - lastReviveTickAt;
+        lastReviveTickAt = now;
+        if(dt > 0.5)
+        {
+            dt = 0.1;
+        }
+
+        rp = mpghosts_getPlayer(partnerName);
+        if(!rp || !rp.ghost || VecDistance(thePlayer.GetWorldPosition(), rp.ghost.GetWorldPosition()) > 2.5)
+        {
+            reviveProgress = 0;
+            return;
+        }
+        if(reviveProgress == 0)
+        {
+            Note("oživuješ hráče " + partnerName + ", zůstaň u něj 3 s...");
+        }
+        reviveProgress += dt;
+        if(reviveProgress >= 3.0)
+        {
+            reviveProgress = 0;
+            reviveSeq += 1;
+            Note("hráč " + partnerName + " je zpátky na nohou.");
         }
     }
 
     private function EnterDowned(now : float)
     {
+        // the partner's copy of this player stays standing; the chat line shows above this player's head there
+        mpghosts_chat("Jsem na zemi! Pojď ke mně a zůstaň u mě 3 s.");
         downed = true;
         downedAt = now;
+        calmSince = -1;
         thePlayer.SetImmortalityMode(AIM_Invulnerable, AIC_Cheat);
         thePlayer.BlockAllActions('WO_Downed', true);
         thePlayer.SetBehaviorVariable('unconsciousEnd', 0);
         thePlayer.RaiseForceEvent('Unconscious');
         if(partnerName != "")
         {
-            Note("jsi na zemi! " + partnerName + " tě může oživit Interakcí u tebe (" + FloatToStringPrec(COOP_DOWNED_TIME(), 0) + " s).");
+            Note("jsi na zemi! " + partnerName + " tě oživí, když u tebe 3 s postojí. Po konci boje vstaneš sám.");
         }
         else
         {
@@ -653,7 +1195,7 @@ class r_CoopParty
     {
         if(value && !partnerDowned)
         {
-            Note(partnerName + " je na zemi! Běž k němu a stiskni Interakci.");
+            Note(partnerName + " je na zemi! Běž k němu a 3 s u něj postůj.");
         }
         partnerDowned = value;
     }
@@ -713,8 +1255,15 @@ class r_CoopParty
         }
     }
 
+    public function OnSaveCompleted()
+    {
+        RefreshNewestSave();
+        CheckpointSaved();
+        GetProfile().OnSaveCompleted();
+    }
+
     // Loads the leader's newest save, which the join launcher keeps copied into this PC's co-op slot.
-    public function Resync() : bool
+    public function Resync(optional quiet : bool) : bool
     {
         var saves : array<SSavegameInfo>;
         var wanted : string;
@@ -722,7 +1271,10 @@ class r_CoopParty
 
         if(leaderSave == "")
         {
-            Note("nevím, kterou uloženou hru načíst: nejsi v partě s hostem.");
+            if(!quiet)
+            {
+                Note("nevím, kterou uloženou hru načíst: nejsi v partě s hostem.");
+            }
             return false;
         }
 
@@ -738,7 +1290,10 @@ class r_CoopParty
             }
         }
 
-        Note("poslední uložená hra hráče " + LeaderName() + " u tebe ještě není. Nech běžet okno co-op spouštěče a zkus to za chvíli.");
+        if(!quiet)
+        {
+            Note("poslední uložená hra hráče " + LeaderName() + " u tebe ještě není. Nech běžet okno co-op spouštěče a zkus to za chvíli.");
+        }
         return false;
     }
 
@@ -752,7 +1307,8 @@ class r_CoopParty
         {
             return;
         }
-        if(npc.GetAttitude(thePlayer) == AIA_Hostile)
+        // only neutral bystanders (guards, townsfolk): allies are friendly and shrug off a stray hit, as in the game
+        if(npc.GetAttitude(thePlayer) != AIA_Neutral || npc.IsImportantCharacter())
         {
             return;
         }
@@ -779,7 +1335,9 @@ class r_CoopParty
         for(i = 0; i < entities.Size(); i += 1)
         {
             npc = (CNewNPC)entities[i];
-            if(!npc || npc.HasTag('MPEntity') || npc.GetReadableName() != tpl)
+            // the leader's copy must be a neutral bystander too: never turn an ally or a quest character
+            if(!npc || npc.HasTag('MPEntity') || npc.GetReadableName() != tpl || npc.GetAttitude(thePlayer) != AIA_Neutral
+                || npc.IsImportantCharacter())
             {
                 continue;
             }
@@ -856,8 +1414,35 @@ function OnSaveCompleted(type : ESaveGameType, succeeded : bool)
     wrappedMethod(type, succeeded);
     if(succeeded && r_getMultiplayerClient())
     {
-        r_getMultiplayerClient().getCoopParty().RefreshNewestSave();
+        r_getMultiplayerClient().getCoopParty().OnSaveCompleted();
     }
+}
+
+// what the co-op sees right now, for finding out why something isn't shared
+exec function coopstatus()
+{
+    var text : string;
+
+    text = theGame.r_getMultiplayerClient().getCoopEnemies().StatusText();
+    theGame.GetGuiManager().ShowNotification("Co-op: " + text);
+    theGame.witcherLog.AddMessage("Co-op: " + text);
+}
+
+@wrapMethod(CR4Player)
+function OnItemGiven(data : SItemChangedData)
+{
+    wrappedMethod(data);
+    theGame.r_getMultiplayerClient().getCoopParty().OnLocalItemGiven(data);
+}
+
+exec function kjakubovi()
+{
+    theGame.r_getMultiplayerClient().getCoopParty().GoToLeader();
+}
+
+exec function tohost()
+{
+    theGame.r_getMultiplayerClient().getCoopParty().GoToLeader();
 }
 
 // member: load the leader's newest save (kept in the co-op slot by the join launcher)

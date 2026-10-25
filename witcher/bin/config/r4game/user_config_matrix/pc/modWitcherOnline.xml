@@ -52,4 +52,48 @@
 		</VisibleVars>
 		
 	</Group>
+	<Group id="MPGhosts_Profile" displayName="hidden">
+		<VisibleVars>
+			<Var id="WO_P00" displayName="WO_P00" displayType="TOGGLE"/>
+			<Var id="WO_P01" displayName="WO_P01" displayType="TOGGLE"/>
+			<Var id="WO_P02" displayName="WO_P02" displayType="TOGGLE"/>
+			<Var id="WO_P03" displayName="WO_P03" displayType="TOGGLE"/>
+			<Var id="WO_P04" displayName="WO_P04" displayType="TOGGLE"/>
+			<Var id="WO_P05" displayName="WO_P05" displayType="TOGGLE"/>
+			<Var id="WO_P06" displayName="WO_P06" displayType="TOGGLE"/>
+			<Var id="WO_P07" displayName="WO_P07" displayType="TOGGLE"/>
+			<Var id="WO_P08" displayName="WO_P08" displayType="TOGGLE"/>
+			<Var id="WO_P09" displayName="WO_P09" displayType="TOGGLE"/>
+			<Var id="WO_P10" displayName="WO_P10" displayType="TOGGLE"/>
+			<Var id="WO_P11" displayName="WO_P11" displayType="TOGGLE"/>
+			<Var id="WO_P12" displayName="WO_P12" displayType="TOGGLE"/>
+			<Var id="WO_P13" displayName="WO_P13" displayType="TOGGLE"/>
+			<Var id="WO_P14" displayName="WO_P14" displayType="TOGGLE"/>
+			<Var id="WO_P15" displayName="WO_P15" displayType="TOGGLE"/>
+			<Var id="WO_P16" displayName="WO_P16" displayType="TOGGLE"/>
+			<Var id="WO_P17" displayName="WO_P17" displayType="TOGGLE"/>
+			<Var id="WO_P18" displayName="WO_P18" displayType="TOGGLE"/>
+			<Var id="WO_P19" displayName="WO_P19" displayType="TOGGLE"/>
+			<Var id="WO_P20" displayName="WO_P20" displayType="TOGGLE"/>
+			<Var id="WO_P21" displayName="WO_P21" displayType="TOGGLE"/>
+			<Var id="WO_P22" displayName="WO_P22" displayType="TOGGLE"/>
+			<Var id="WO_P23" displayName="WO_P23" displayType="TOGGLE"/>
+			<Var id="WO_P24" displayName="WO_P24" displayType="TOGGLE"/>
+			<Var id="WO_P25" displayName="WO_P25" displayType="TOGGLE"/>
+			<Var id="WO_P26" displayName="WO_P26" displayType="TOGGLE"/>
+			<Var id="WO_P27" displayName="WO_P27" displayType="TOGGLE"/>
+			<Var id="WO_P28" displayName="WO_P28" displayType="TOGGLE"/>
+			<Var id="WO_P29" displayName="WO_P29" displayType="TOGGLE"/>
+			<Var id="WO_P30" displayName="WO_P30" displayType="TOGGLE"/>
+			<Var id="WO_P31" displayName="WO_P31" displayType="TOGGLE"/>
+			<Var id="WO_P32" displayName="WO_P32" displayType="TOGGLE"/>
+			<Var id="WO_P33" displayName="WO_P33" displayType="TOGGLE"/>
+			<Var id="WO_P34" displayName="WO_P34" displayType="TOGGLE"/>
+			<Var id="WO_P35" displayName="WO_P35" displayType="TOGGLE"/>
+			<Var id="WO_P36" displayName="WO_P36" displayType="TOGGLE"/>
+			<Var id="WO_P37" displayName="WO_P37" displayType="TOGGLE"/>
+			<Var id="WO_P38" displayName="WO_P38" displayType="TOGGLE"/>
+			<Var id="WO_P39" displayName="WO_P39" displayType="TOGGLE"/>
+		</VisibleVars>
+	</Group>
 </UserConfig>

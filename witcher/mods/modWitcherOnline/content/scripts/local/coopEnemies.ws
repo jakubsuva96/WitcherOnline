@@ -62,6 +62,9 @@ class r_CoopPuppet
     public var netId : int;
     public var spawned : bool;  // created here (destroyed on release) or a local twin (AI given back on release)
     public var aiId : int;
+    public var lastDotFxAt : float;
+    public var killedAt : float;
+    public var killTries : int;
     public var target : Vector;
     public var yaw : float;
     public var hp : float;
@@ -325,6 +328,7 @@ class r_CoopAck
 
 class r_CoopEnemies
 {
+    private var lastSuppressAt : float;
     private var epoch : int;    // this game as leader: changes on restart so members drop stale ids
     private var session : int;  // this game as member: lets the leader restart hit numbering
     private var nextNetId : int;
@@ -531,6 +535,33 @@ class r_CoopEnemies
         }
     }
 
+    // leader: damage to a shared enemy, from either player, scaled while a member is in the fight
+    public function ScaleSharedDamage(npc : CNewNPC, action : W3DamageAction)
+    {
+        var globals : array<r_RemotePlayer>;
+        var me : string;
+        var area, i : int;
+
+        if(COOP_ENEMY_DAMAGE_TAKEN() >= 1.0 || GetRole() != 1 || !FindHostEnemyByNpc(npc))
+        {
+            return;
+        }
+
+        me = theGame.r_getMultiplayerClient().getUsername();
+        area = WO_CurrentAreaCode();
+        globals = theGame.r_getMultiplayerClient().getGlobalPlayers();
+        for(i = 0; i < globals.Size(); i += 1)
+        {
+            if(globals[i] && globals[i].inParty && globals[i].joinedParty == me && globals[i].area == area
+                && VecDistance(globals[i].pos, npc.GetWorldPosition()) <= COOP_SHARE_RANGE())
+            {
+                action.processedDmg.vitalityDamage *= COOP_ENEMY_DAMAGE_TAKEN();
+                action.processedDmg.essenceDamage *= COOP_ENEMY_DAMAGE_TAKEN();
+                return;
+            }
+        }
+    }
+
     // 0 off, 1 leader of a party with members, 2 member
     public function GetRole() : int
     {
@@ -626,16 +657,22 @@ class r_CoopEnemies
                 delayedHurts.Clear();
             }
 
-            // the leader's snapshots also stop while its game sits in a menu; far from the leader, this world
-            // runs its own monsters again
-            if(now - lastSnapshotAt > 8.0 || !LeaderNear())
+            // far from the leader, or after a long silence, this world runs its own monsters again; a short silence
+            // (the leader in a menu or loading) holds everything as it is instead of waking every local copy
+            if(!LeaderNear() || now - lastSnapshotAt > 30.0)
             {
                 ReleaseAll();
             }
-            else
+            else if(now - lastSnapshotAt <= 8.0)
             {
                 ArmLeaderGhost();
                 UpdatePuppets(now);
+                EnsureDeadPuppets(now);
+                if(now - lastSuppressAt > 0.5)
+                {
+                    SuppressUnmatched();
+                    lastSuppressAt = now;
+                }
             }
             ApplyDueHurts(now);
             SendHits(now);
@@ -664,6 +701,13 @@ class r_CoopEnemies
         var me : string;
         var area : int;
         var i, j : int;
+
+        // a fistfight is the leader's alone: the member only watches it
+        if(thePlayer.IsInFistFightMiniGame())
+        {
+            hostEnemies.Clear();
+            return;
+        }
 
         candidates = thePlayer.GetNPCsAndPlayersInRange(40, 48, '', FLAG_Attitude_Hostile + FLAG_OnlyAliveActors + FLAG_ExcludePlayer);
 
@@ -706,7 +750,8 @@ class r_CoopEnemies
             e = FindHostEnemyByNpc(npc);
             if(!e)
             {
-                if(hostEnemies.Size() >= 24)
+                // a snapshot must fit the 8 KB datagram both ends receive (about 230 characters per enemy at most)
+                if(hostEnemies.Size() >= 30)
                 {
                     continue;
                 }
@@ -735,7 +780,15 @@ class r_CoopEnemies
             {
                 e.deadAt = now;
             }
-            if((e.deadAt >= 0 && now - e.deadAt > 4.0) || (e.deadAt < 0 && now - e.lastSeenAt > 3.0))
+            if(e.deadAt >= 0 && now - e.deadAt > 4.0)
+            {
+                hostEnemies.Erase(i);
+            }
+            // captured at 40 m, kept to 80 m or 10 s unseen: flyers circling wide and chasers don't drop out mid-fight
+            // (a dropped enemy's copy on the member would start fighting on its own)
+            else if(e.deadAt < 0 && now - e.lastSeenAt > 3.0
+                && (now - e.lastSeenAt > 10.0 || VecDistance(e.npc.GetWorldPosition(), thePlayer.GetWorldPosition()) > 80.0
+                    || e.npc.GetAttitude(thePlayer) != AIA_Hostile))
             {
                 hostEnemies.Erase(i);
             }
@@ -1107,6 +1160,11 @@ class r_CoopEnemies
 
         e = FindHostEnemy(netId);
         if(!e || !e.npc || !e.npc.IsAlive() || (frac <= 0 && effects.Size() == 0))
+        {
+            return;
+        }
+        // an enemy in this player's finisher belongs to that animation; the other player's swings don't land on it
+        if(e.npc.IsInFinisherAnim())
         {
             return;
         }
@@ -2255,7 +2313,24 @@ class r_CoopEnemies
         {
             if(!seen.Contains(puppets[i].netId))
             {
+                // gone from the leader's list at no health: it died there (some corpses vanish before a dead
+                // snapshot goes out)
+                if(puppets[i].alive && puppets[i].hp <= 0.02)
+                {
+                    KillPuppet(puppets[i]);
+                }
+                if(!puppets[i].alive)
+                {
+                    BuryPuppet(puppets[i]);
+                    puppets.Erase(i);
+                    continue;
+                }
                 ReleasePuppet(puppets[i]);
+                // the leader still here: a local copy it stopped reporting stays hidden and idle, not fighting alone
+                if(!puppets[i].spawned && puppets[i].npc && puppets[i].alive && puppets[i].npc.IsAlive() && LeaderNear())
+                {
+                    SuppressNpc(puppets[i].npc);
+                }
                 puppets.Erase(i);
             }
         }
@@ -2351,6 +2426,26 @@ class r_CoopEnemies
         }
     }
 
+    private function ParryHurt(attacker : CActor, h : r_CoopHurt) : bool
+    {
+        var info : SParryInfo;
+        var heavy : bool;
+        var attackName : name;
+
+        heavy = h.hitReaction == (int)EHRT_Heavy;
+        attackName = 'attack_light';
+        if(heavy)
+        {
+            attackName = 'attack_heavy';
+        }
+        info = attacker.ProcessParryInfo(attacker, thePlayer, AST_Horizontal, ASD_LeftRight, attackName, GetInvalidUniqueId(), !heavy);
+        if(!info.canBeParried)
+        {
+            return false;
+        }
+        return thePlayer.PerformParryCheck(info);
+    }
+
     // The leader's monster hit this player's ghost: apply its raw damage here, with the monster's local copy
     // as attacker, so this game's armor, Quen and difficulty count. A hit landing mid-dodge misses.
     private function ApplyHurt(h : r_CoopHurt)
@@ -2361,7 +2456,8 @@ class r_CoopEnemies
         var before : float;
         var i : int;
 
-        if(thePlayer.IsCurrentlyDodging())
+        // a finisher plays out untouched, as in the game (the player is invulnerable in synced animations)
+        if(thePlayer.IsCurrentlyDodging() || thePlayer.IsPerformingFinisher())
         {
             hurtsDodged += 1;
             return;
@@ -2371,6 +2467,14 @@ class r_CoopEnemies
         if(p && p.alive)
         {
             attacker = p.npc;
+        }
+
+        // the leader's hit arrives as plain damage, which the game's parry never sees: a guarding player gets the game's
+        // own parry check against the local copy of the attacker (animation, stamina, heavy blows not parryable)
+        if(attacker && thePlayer.IsGuarded() && ParryHurt(attacker, h))
+        {
+            hurtsDodged += 1;
+            return;
         }
 
         action = new W3DamageAction in theGame.damageMgr;
@@ -2526,8 +2630,8 @@ class r_CoopEnemies
         var dist, bestDist : float;
         var i : int;
 
-        bestDist = 10.0;
-        FindGameplayEntitiesInSphere(entities, pos, 10.0, 32, '', FLAG_OnlyAliveActors, thePlayer);
+        bestDist = 20.0;
+        FindGameplayEntitiesInSphere(entities, pos, 20.0, 48, '', FLAG_OnlyAliveActors, thePlayer);
         for(i = 0; i < entities.Size(); i += 1)
         {
             npc = (CNewNPC)entities[i];
@@ -2601,6 +2705,8 @@ class r_CoopEnemies
         p.yaw = npc.GetHeading();
         p.aiId = ForceIdle(npc);
         p.attackRunningSince = -1;
+        // a copy spawned here takes its template's attitude (animals are neutral); it's the leader's enemy, so fightable
+        npc.SetAttitude(thePlayer, AIA_Hostile);
         // a finisher would kill it here, outside the leader's say ('DisableFinishers' blocks the killing-blow
         // finisher, 'DisableFinisher' the one on a living target)
         BlockFinisher(p, 'DisableFinishers');
@@ -3658,6 +3764,8 @@ class r_CoopEnemies
     private function KillPuppet(p : r_CoopPuppet)
     {
         p.alive = false;
+        p.killedAt = theGame.GetEngineTimeAsSeconds();
+        p.killTries += 1;
         puppetsKilled += 1;
         StopSlotAttack(p);
         if(p.animAiId != 0)
@@ -3673,6 +3781,55 @@ class r_CoopEnemies
         applyingHostState = true;
         p.npc.Kill('W3Coop', true);
         applyingHostState = false;
+    }
+
+    // A copy the leader killed must not stand on here: kill it again a few times, then take it out of sight.
+    private function EnsureDeadPuppets(now : float)
+    {
+        var i : int;
+
+        for(i = 0; i < puppets.Size(); i += 1)
+        {
+            if(puppets[i].alive || !puppets[i].npc || !puppets[i].npc.IsAlive() || now - puppets[i].killedAt < 0.5)
+            {
+                continue;
+            }
+            if(puppets[i].killTries < 3)
+            {
+                KillPuppet(puppets[i]);
+            }
+            else
+            {
+                BuryPuppet(puppets[i]);
+            }
+        }
+    }
+
+    private function BuryPuppet(p : r_CoopPuppet)
+    {
+        if(!p.npc || !p.npc.IsAlive())
+        {
+            return;
+        }
+        if(p.spawned)
+        {
+            p.npc.Destroy();
+        }
+        else
+        {
+            SuppressNpc(p.npc);
+        }
+    }
+
+    public function StatusText() : string
+    {
+        var now : float;
+
+        now = theGame.GetEngineTimeAsSeconds();
+        return "role " + GetRole() + ", leader '" + leaderName + "', snapshot " + FloatToStringPrec(now - lastSnapshotAt, 1)
+            + " s ago, host enemies " + hostEnemies.Size() + ", puppets " + puppets.Size() + ", hidden " + suppressed.Size()
+            + ", bound " + twinsBound + ", spawned " + puppetsSpawned + ", killed " + puppetsKilled
+            + ", spawn failures " + spawnFailures + " " + lastError;
     }
 
     // a puppet the leader no longer reports: spawned ones go away, local twins get their own AI back
@@ -3744,7 +3901,8 @@ class r_CoopEnemies
             }
         }
 
-        actors = thePlayer.GetNPCsAndPlayersInRange(30, 48, '', FLAG_Attitude_Hostile + FLAG_OnlyAliveActors + FLAG_ExcludePlayer);
+        // 50 m: archers and casters standing back shouldn't get a shot in before they are hidden
+        actors = thePlayer.GetNPCsAndPlayersInRange(50, 64, '', FLAG_Attitude_Hostile + FLAG_OnlyAliveActors + FLAG_ExcludePlayer);
         for(i = 0; i < actors.Size(); i += 1)
         {
             npc = (CNewNPC)actors[i];
@@ -3752,15 +3910,25 @@ class r_CoopEnemies
             {
                 continue;
             }
-
-            s = new r_CoopSuppressed in this;
-            s.npc = npc;
-            s.aiId = ForceIdle(npc);
-            npc.SetVisibility(false);
-            npc.SetGameplayVisibility(false);
-            npc.EnableCharacterCollisions(false);
-            suppressed.PushBack(s);
+            SuppressNpc(npc);
         }
+    }
+
+    private function SuppressNpc(npc : CNewNPC)
+    {
+        var s : r_CoopSuppressed;
+
+        if(!npc || IsSuppressed(npc))
+        {
+            return;
+        }
+        s = new r_CoopSuppressed in this;
+        s.npc = npc;
+        s.aiId = ForceIdle(npc);
+        npc.SetVisibility(false);
+        npc.SetGameplayVisibility(false);
+        npc.EnableCharacterCollisions(false);
+        suppressed.PushBack(s);
     }
 
     private function IsSuppressed(npc : CNewNPC) : bool
@@ -3895,9 +4063,13 @@ class r_CoopEnemies
         var p : r_CoopPuppet;
         var hit : r_CoopHit;
         var effects : array<EEffectType>;
+        var petard : W3Petard;
+        var now : float;
         var i : int;
 
-        if(action.attacker != thePlayer || action.IsDoTDamage())
+        // lingering bomb clouds (gas, Dancing Star fire) tick as damage over time: their effects go too, once a second
+        petard = (W3Petard)action.causer;
+        if(action.attacker != thePlayer || (action.IsDoTDamage() && !petard))
         {
             return;
         }
@@ -3905,6 +4077,15 @@ class r_CoopEnemies
         if(!p || !p.alive)
         {
             return;
+        }
+        if(action.IsDoTDamage())
+        {
+            now = theGame.GetEngineTimeAsSeconds();
+            if(now - p.lastDotFxAt < 1.0)
+            {
+                return;
+            }
+            p.lastDotFxAt = now;
         }
         action.GetEffectTypes(effects);
         if(effects.Size() == 0)
@@ -4496,6 +4677,13 @@ function COOP_SHARE_RANGE() : float
     return 60.0;
 }
 
+// Two players deal about twice one player's damage: shared enemies take this share of it while a member fights near
+// them (0.6 = about 1.7x health). 1.0 turns it off.
+function COOP_ENEMY_DAMAGE_TAKEN() : float
+{
+    return 0.6;
+}
+
 // seconds between enemy snapshots, hit claims and hurts; 0.1 was tuned for Steam relay, a home network takes 0.05
 function COOP_SEND_INTERVAL() : float
 {
@@ -4900,6 +5088,7 @@ function OnTakeDamage(action : W3DamageAction)
     }
     else if(coop)
     {
+        coop.ScaleSharedDamage(this, action);
         coop.OnEnemyDamaged(this, action);
         client.getCoopParty().OnNpcDamaged(this, action);
     }
@@ -4916,6 +5105,7 @@ function OnQuestEvent(journalQuest : CJournalQuest)
     if(client)
     {
         client.getCoopEnemies().OnJournalChange(journalQuest);
+        client.getCoopParty().OnLocalQuestEvent(journalQuest);
     }
     return wrappedMethod(journalQuest);
 }
