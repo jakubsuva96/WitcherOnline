@@ -17,7 +17,9 @@ namespace wo_native
 		Kicked = 7,
 		Banned = 8,
 		NotWhitelisted = 9,
-		Coop = 10
+		Coop = 10,
+		// fields: what doesn't match ("mod" or "game"), the host's version
+		VersionMismatch = 11
 	};
 
 	struct InboundMessage
@@ -42,4 +44,5 @@ namespace wo_native
 	bool PopOutbound(std::string &payload);
 	void PushInbound(InboundMessage &&message);
 	void PushControl(InboundOpcode opcode);
+	void PushControl(InboundOpcode opcode, std::vector<std::string> &&fields);
 } // namespace wo_native

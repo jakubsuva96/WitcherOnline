@@ -4164,7 +4164,8 @@ class r_CoopEnemies
 
     // ---------------------------------------------------------------- quest facts
 
-    // A save was loaded: fact changes count from here (the journal list works the same way).
+    // The player spawned (a save loaded, a world change or a Ciri swap). The native keeps the first baseline of the
+    // game session, so fact changes count from the first load, not from the latest spawn.
     public function OnSessionStart()
     {
         factsReady = WO_FactsBaseline();

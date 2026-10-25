@@ -160,12 +160,14 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClInclude Include="crash.h" />
     <ClInclude Include="framework.h" />
     <ClInclude Include="NativeBridge.h" />
     <ClInclude Include="pch.h" />
     <ClInclude Include="script.h" />
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="crash.cpp" />
     <ClCompile Include="dllmain.cpp" />
     <ClCompile Include="NativeBridge.cpp" />
     <ClCompile Include="pch.cpp">

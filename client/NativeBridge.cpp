@@ -282,6 +282,14 @@ namespace wo_native
 		PushInbound(std::move(message));
 	}
 
+	void PushControl(InboundOpcode opcode, std::vector<std::string> &&fields)
+	{
+		InboundMessage message;
+		message.opcode = opcode;
+		message.fields = std::move(fields);
+		PushInbound(std::move(message));
+	}
+
 	// ---- facts: read the engine's facts database (party leader's quest facts for members) ----
 
 	static bool ReadMemory(const void *address, void *out, size_t size)
@@ -451,9 +459,17 @@ namespace wo_native
 	static bool g_factsBaselineValid = false;
 	static size_t g_factsPage = 0;
 
-	// session start (a save loaded): changes are counted from here
+	// session start: changes are counted from the first save this game loads. Scripts call this on every player
+	// spawn, which also happens on each world change and Ciri swap; re-recording there made a member who joined
+	// later miss every change made before it, so a valid baseline is kept for the rest of the process.
 	static void WO_FactsBaseline(void *, void *frame, void *result)
 	{
+		if (g_factsBaselineValid)
+		{
+			WNB_ReturnBool(frame, result, true);
+			return;
+		}
+
 		g_factsBaseline.clear();
 		g_factsBaselineValid = ReadAllFacts(g_factsBaseline);
 		g_factsPage = 0;

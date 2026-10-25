@@ -5098,7 +5098,42 @@ statemachine class r_MultiplayerClient
         tutorialPopup(messagetitle, messagebody);
     }
 
-    private var usernameTakenUser : string; 
+    // W3Coop version handshake: the host refused this game because the mod or the game build differs
+    // (no .w3strings entry yet, so the text is English)
+    function showVersionMismatch()
+    {
+        var messagetitle : string;
+        var messagebody : string;
+
+        messagetitle = GetLocStringById(2111114249);
+        if(versionMismatchWhat == "game")
+        {
+            messagebody = "The host plays game version " + versionMismatchHost + ", this game is " + versionMismatchMine
+                + ".<br/><br/>Both players need the same Witcher 3 patch.";
+        }
+        else
+        {
+            messagebody = "The host runs W3Coop " + versionMismatchHost + ", this game has " + versionMismatchMine
+                + ".<br/><br/>Install the same W3Coop build on both PCs.";
+        }
+
+        tutorialPopup(messagetitle, messagebody);
+    }
+
+    private var versionMismatch : bool;
+    private var versionMismatchWhat : string;
+    private var versionMismatchHost : string;
+    private var versionMismatchMine : string;
+
+    function setVersionMismatch(what : string, hostVersion : string, mine : string)
+    {
+        versionMismatch = true;
+        versionMismatchWhat = what;
+        versionMismatchHost = hostVersion;
+        versionMismatchMine = mine;
+    }
+
+    private var usernameTakenUser : string;
     private var usernameTaken : bool;
     private var playerBanned : bool;
     private var playerKicked : bool;
@@ -5176,6 +5211,11 @@ statemachine class r_MultiplayerClient
         else if(getUsernameTaken() && !getAlertedDisconnect())
         {
             showUsernameTaken();
+            setAlertedDisconnect();
+        }
+        else if(versionMismatch && !getAlertedDisconnect())
+        {
+            showVersionMismatch();
             setAlertedDisconnect();
         }
     }
@@ -5743,6 +5783,10 @@ statemachine class r_MultiplayerClient
 
                 case 10:
                     client.getCoopEnemies().OnMessage();
+                    break;
+
+                case 11:
+                    client.setVersionMismatch(WO_Str(0), WO_Str(1), WO_Str(2));
                     break;
 
                 default:

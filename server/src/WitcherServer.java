@@ -50,8 +50,18 @@ public class WitcherServer
     private static final long PLAYER_TIMEOUT_NANOS = 5_000_000_000L;
     private static final long USERNAME_HOLD_NANOS = 60_000_000_000L;
     private static final long BROADCAST_HEARTBEAT_NANOS = 60_000_000_000L;
-    private static final int MAX_COOP_CHANNELS = 4;
+    // a leader sends en, hurt, jr and fx, a member hit; a player whose role changes needs room for both sets
+    private static final int MAX_COOP_CHANNELS = 8;
     private static final long COOP_REPEAT_NANOS = 100_000_000L;
+    // a channel the player stopped sending (its role changed) is no longer repeated after this long
+    private static final long COOP_STALE_NANOS = 10_000_000_000L;
+
+    // W3Coop version handshake: a client says HELLO with these before anything else; both must match the server's
+    public static final String PROTOCOL_VERSION = "1";
+    public static final String MOD_VERSION = "0.3.0-dev";
+    // a session that sends game data but no HELLO for this long is an older client and is turned away
+    private static final long HELLO_GRACE_NANOS = 5_000_000_000L;
+    private static final AtomicBoolean requireHello = new AtomicBoolean(true);
 
     private static final int DEFAULT_PORT = 40000;
     private static final DateTimeFormatter LOG_TIME = DateTimeFormatter.ofPattern("HH:mm:ss");
@@ -68,6 +78,7 @@ public class WitcherServer
         Properties serverProperties = loadServerProperties();
         int port = choosePort(args, serverProperties);
         whitelistEnabled.set(readBoolean(serverProperties, "whitelist", false));
+        requireHello.set(readBoolean(serverProperties, "requireHello", true));
 
         loadBannedIps();
         loadWhitelistIps();
@@ -94,11 +105,32 @@ public class WitcherServer
             dbg("Status SVG: http://127.0.0.1:%d/status.svg\n", svgPort);
         }
 
+        if (readBoolean(serverProperties, "crashReports", true))
+        {
+            int port2 = DEFAULT_CRASH_PORT;
+            String configured = serverProperties.getProperty("crashPort");
+            if (configured != null && parsePort(configured.trim()) != null)
+            {
+                port2 = parsePort(configured.trim());
+            }
+
+            try
+            {
+                startCrashReportServer(port2);
+                crashReportPort = port2;
+                dbg("Collecting players' crash reports on TCP *:%d into %s\n", port2, crashReportsDir());
+            }
+            catch (IOException e)
+            {
+                dbg("Crash reports are off: TCP port %d is not free (%s)\n", port2, e.getMessage());
+            }
+        }
+
         dbg("For help, type \"help\" or \"?\"\n");
 
         Thread recvThread = startThread("udp-recv", () -> receiveLoop(socket));
         Thread sendThread = startThread("udp-broadcast", () -> broadcastLoop(socket));
-        Thread cleanupThread = startThread("udp-cleanup", WitcherServer::cleanupLoop);
+        Thread cleanupThread = startThread("udp-cleanup", () -> cleanupLoop(socket));
         Thread consoleThread = startThread("console", () -> consoleLoop(socket));
 
         recvThread.join();
@@ -138,6 +170,124 @@ public class WitcherServer
         server.start();
 
         return server;
+    }
+
+    // ---- crash reports: players' games send them here over the LAN after a crash (see the client's crash.cpp) ----
+
+    private static final int DEFAULT_CRASH_PORT = 40003;
+    private static final long MAX_CRASH_FILE_BYTES = 512L * 1024 * 1024;
+    private static volatile int crashReportPort = 0;
+
+    private static Path crashReportsDir()
+    {
+        return appDir().resolve("crash-reports");
+    }
+
+    private static void startCrashReportServer(int crashPort) throws IOException
+    {
+        HttpServer server = HttpServer.create(new InetSocketAddress(crashPort), 0);
+        server.createContext("/crash", WitcherServer::handleCrashReport);
+        server.setExecutor(null);
+        server.start();
+    }
+
+    private static String safeFileName(String text)
+    {
+        if (text == null)
+        {
+            return "";
+        }
+
+        String safe = text.replaceAll("[^A-Za-z0-9_.-]", "_");
+        // no "." or ".." as a whole name, nothing hidden
+        while (safe.startsWith("."))
+        {
+            safe = safe.substring(1);
+        }
+        return safe.length() > 120 ? safe.substring(0, 120) : safe;
+    }
+
+    // POST /crash?user=..&report=..&file=.. with the file as the body: saved as crash-reports/<user>/<report>/<file>
+    private static void handleCrashReport(HttpExchange exchange) throws IOException
+    {
+        try
+        {
+            if (!"POST".equals(exchange.getRequestMethod()))
+            {
+                sendHttp(exchange, 405, "text/plain; charset=utf-8", "POST only\n");
+                return;
+            }
+
+            java.net.InetAddress remote = exchange.getRemoteAddress().getAddress();
+            if (!(remote.isLoopbackAddress() || remote.isSiteLocalAddress() || remote.isLinkLocalAddress()))
+            {
+                sendHttp(exchange, 403, "text/plain; charset=utf-8", "LAN only\n");
+                return;
+            }
+
+            Map<String, String> query = new java.util.HashMap<>();
+            String raw = exchange.getRequestURI().getRawQuery();
+            if (raw != null)
+            {
+                for (String pair : raw.split("&"))
+                {
+                    int eq = pair.indexOf('=');
+                    if (eq > 0)
+                    {
+                        query.put(pair.substring(0, eq), java.net.URLDecoder.decode(pair.substring(eq + 1), StandardCharsets.UTF_8));
+                    }
+                }
+            }
+
+            String user = safeFileName(query.get("user"));
+            String report = safeFileName(query.get("report"));
+            String file = safeFileName(query.get("file"));
+            if (user.isEmpty() || report.isEmpty() || file.isEmpty())
+            {
+                sendHttp(exchange, 400, "text/plain; charset=utf-8", "user, report and file are required\n");
+                return;
+            }
+
+            Path dir = crashReportsDir().resolve(user).resolve(report).normalize();
+            if (!dir.startsWith(crashReportsDir()))
+            {
+                sendHttp(exchange, 400, "text/plain; charset=utf-8", "bad path\n");
+                return;
+            }
+            Files.createDirectories(dir);
+
+            Path target = dir.resolve(file);
+            long written = 0;
+            try (var in = exchange.getRequestBody(); OutputStream out = Files.newOutputStream(target))
+            {
+                byte[] chunk = new byte[65536];
+                int n;
+                while ((n = in.read(chunk)) > 0)
+                {
+                    written += n;
+                    if (written > MAX_CRASH_FILE_BYTES)
+                    {
+                        break;
+                    }
+                    out.write(chunk, 0, n);
+                }
+            }
+
+            if (written > MAX_CRASH_FILE_BYTES)
+            {
+                Files.deleteIfExists(target);
+                sendHttp(exchange, 413, "text/plain; charset=utf-8", "too large\n");
+                return;
+            }
+
+            dbg("Crash report from %s: %s/%s (%d bytes) -> %s\n", user, report, file, written, target);
+            sendHttp(exchange, 200, "text/plain; charset=utf-8", "saved\n");
+        }
+        catch (Exception e)
+        {
+            dbg("Crash report upload failed: %s\n", e.getMessage());
+            sendHttp(exchange, 500, "text/plain; charset=utf-8", "error\n");
+        }
     }
 
     private static void handleStatusSvg(HttpExchange exchange) throws IOException
@@ -540,6 +690,18 @@ public class WitcherServer
 
         String opcode = parts[0];
 
+        if ("DISCOVER".equals(opcode))
+        {
+            handleDiscover(socket, sender, parts);
+            return;
+        }
+
+        if ("HELLO".equals(opcode))
+        {
+            handleHello(socket, sender, parts);
+            return;
+        }
+
         if (!isUpdateOpcode(opcode))
         {
             return;
@@ -707,6 +869,11 @@ public class WitcherServer
 
         current.lastSeen = now;
 
+        if (!current.helloSeen)
+        {
+            applyAcceptedHello(usernameKey, current, senderIp);
+        }
+
         List<String> fields = new ArrayList<>();
 
         for (int i = fieldsStart; i < parts.length; i++)
@@ -732,10 +899,15 @@ public class WitcherServer
         {
             String channel = frozenFields.isEmpty() ? "" : frozenFields.get(0);
 
-            if (!channel.isEmpty() && channel.length() <= 8
-                    && (current.coopFields.containsKey(channel) || current.coopFields.size() < MAX_COOP_CHANNELS))
+            if (!channel.isEmpty() && channel.length() <= 8)
             {
+                if (!current.coopFields.containsKey(channel) && current.coopFields.size() >= MAX_COOP_CHANNELS)
+                {
+                    // full: the channel heard from least recently gives way (before, the new one was dropped silently)
+                    evictOldestCoopChannel(current);
+                }
                 current.coopFields.put(channel, frozenFields);
+                current.coopReceivedAt.put(channel, now);
                 // forwarded at once: a monster's attack shouldn't wait up to a broadcast tick (100 ms) to reach members
                 int sent = broadcastChunk(socket, snapshotRecipients(), current, "COOP", frozenFields);
                 totalPacketsSent.addAndGet(sent);
@@ -770,7 +942,178 @@ public class WitcherServer
         }
     }
 
-    private static void cleanupLoop()
+    private static void evictOldestCoopChannel(PlayerSession session)
+    {
+        String oldest = null;
+        long oldestAt = Long.MAX_VALUE;
+
+        for (Map.Entry<String, Long> entry : session.coopReceivedAt.entrySet())
+        {
+            if (entry.getValue() < oldestAt)
+            {
+                oldest = entry.getKey();
+                oldestAt = entry.getValue();
+            }
+        }
+
+        if (oldest == null && !session.coopFields.isEmpty())
+        {
+            oldest = session.coopFields.keySet().iterator().next();
+        }
+
+        if (oldest != null)
+        {
+            dbg("Co-op channel %s of %s gives way (channel limit %d)\n", oldest, session.username, MAX_COOP_CHANNELS);
+            removeCoopChannel(session, oldest);
+        }
+    }
+
+    private static void removeCoopChannel(PlayerSession session, String channel)
+    {
+        session.coopFields.remove(channel);
+        session.coopForwardedAt.remove(channel);
+        session.coopReceivedAt.remove(channel);
+    }
+
+    // ---- W3Coop version handshake and LAN discovery ----
+
+    // a HELLO the server accepted, kept until that player's game data arrives (a HELLO can overtake the session)
+    private record AcceptedHello(String ip, String modVersion, String gameVersion, long at)
+    {
+    }
+
+    private static final Map<String, AcceptedHello> acceptedHellos = new ConcurrentHashMap<>();
+    private static final long ACCEPTED_HELLO_HOLD_NANOS = 600_000_000_000L;
+
+    // "DISCOVER \t W3COOP \t protocol", broadcast by a client looking for a host on the LAN;
+    // the answer goes straight back to it: "W3COOP_HOST \t protocol \t modVersion \t port \t players"
+    private static void handleDiscover(DatagramSocket socket, ClientEndpoint sender, String[] parts)
+    {
+        if (parts.length < 2 || !"W3COOP".equals(parts[1]))
+        {
+            return;
+        }
+
+        safeSend(socket, sender, "W3COOP_HOST\t" + PROTOCOL_VERSION + "\t" + MOD_VERSION + "\t" + socket.getLocalPort() + "\t" + players.size());
+    }
+
+    // "HELLO \t username \t protocol \t modVersion \t gameVersion": answered with WELCOME or an ERROR that says what
+    // doesn't match, so the player sees "host has X, you have Y" instead of a silent desync
+    private static void handleHello(DatagramSocket socket, ClientEndpoint sender, String[] parts)
+    {
+        if (parts.length < 5)
+        {
+            return;
+        }
+
+        String username = unescapeField(parts[1]).trim();
+        String protocol = parts[2].trim();
+        String modVersion = parts[3].trim();
+        String gameVersion = parts[4].trim();
+
+        if (username.isEmpty())
+        {
+            safeSend(socket, sender, "ERROR\tINVALID_USERNAME");
+            return;
+        }
+
+        String usernameKey = normalizeUsernameKey(username);
+        String senderIp = normalizeIp(sender.address.getHostAddress());
+        long now = System.nanoTime();
+
+        if (!PROTOCOL_VERSION.equals(protocol) || !MOD_VERSION.equals(modVersion))
+        {
+            dbg("Rejected %s from %s: mod %s (protocol %s), host has %s (protocol %s)\n",
+                    username, sender, modVersion, protocol, MOD_VERSION, PROTOCOL_VERSION);
+            safeSend(socket, sender, "ERROR\tVERSION_MISMATCH\t" + MOD_VERSION + "\t" + PROTOCOL_VERSION);
+            return;
+        }
+
+        for (PlayerSession other : players.values())
+        {
+            if (other.helloSeen && !other.gameVersion.isEmpty() && !other.gameVersion.equals(gameVersion)
+                    && !normalizeUsernameKey(other.username).equals(usernameKey))
+            {
+                dbg("Rejected %s from %s: game %s, %s has game %s\n", username, sender, gameVersion, other.username, other.gameVersion);
+                safeSend(socket, sender, "ERROR\tGAME_VERSION_MISMATCH\t" + other.gameVersion);
+                return;
+            }
+        }
+
+        PlayerSession owner = players.get(usernameKey);
+        if (owner != null && !normalizeIp(owner.endpoint.address.getHostAddress()).equals(senderIp)
+                && (now - owner.lastSeen) <= PLAYER_TIMEOUT_NANOS)
+        {
+            safeSend(socket, sender, "ERROR\tUSERNAME_TAKEN");
+            return;
+        }
+
+        UsernameReservation reservation = reservedUsernames.get(usernameKey);
+        if (reservation != null && now < reservation.expiresAt && !reservation.ip.equals(senderIp))
+        {
+            safeSend(socket, sender, "ERROR\tUSERNAME_TAKEN");
+            return;
+        }
+
+        acceptedHellos.put(usernameKey, new AcceptedHello(senderIp, modVersion, gameVersion, now));
+        if (owner != null)
+        {
+            applyAcceptedHello(usernameKey, owner, senderIp);
+        }
+
+        // the last field tells the client where to send crash reports (0: not collected)
+        safeSend(socket, sender, "WELCOME\t" + MOD_VERSION + "\t" + PROTOCOL_VERSION + "\t" + crashReportPort);
+    }
+
+    private static void applyAcceptedHello(String usernameKey, PlayerSession session, String senderIp)
+    {
+        AcceptedHello hello = acceptedHellos.get(usernameKey);
+
+        if (hello == null || !hello.ip().equals(senderIp))
+        {
+            return;
+        }
+
+        session.modVersion = hello.modVersion();
+        session.gameVersion = hello.gameVersion();
+        session.helloSeen = true;
+        dbg("%s runs W3Coop %s on game %s\n", session.username, hello.modVersion(), hello.gameVersion());
+    }
+
+    // sessions that sent game data but never a HELLO run an older client: tell them and drop them
+    private static void dropSessionsWithoutHello(DatagramSocket socket, long now)
+    {
+        if (!requireHello.get())
+        {
+            return;
+        }
+
+        for (Map.Entry<String, PlayerSession> entry : players.entrySet())
+        {
+            PlayerSession session = entry.getValue();
+
+            if (session.helloSeen || (now - session.createdAt) <= HELLO_GRACE_NANOS)
+            {
+                continue;
+            }
+
+            if (players.remove(entry.getKey(), session))
+            {
+                dbg("Dropped %s (%s): no version handshake, client is older than %s\n", session.username, session.endpoint, MOD_VERSION);
+                safeSend(socket, session.endpoint, "ERROR\tVERSION_MISMATCH\t" + MOD_VERSION + "\t" + PROTOCOL_VERSION);
+            }
+        }
+
+        for (Map.Entry<String, AcceptedHello> entry : acceptedHellos.entrySet())
+        {
+            if ((now - entry.getValue().at()) > ACCEPTED_HELLO_HOLD_NANOS && !players.containsKey(entry.getKey()))
+            {
+                acceptedHellos.remove(entry.getKey(), entry.getValue());
+            }
+        }
+    }
+
+    private static void cleanupLoop(DatagramSocket socket)
     {
         while (running.get())
         {
@@ -786,6 +1129,8 @@ public class WitcherServer
                         reserveTimedOutPlayer(entry.getKey(), session, now);
                     }
                 }
+
+                dropSessionsWithoutHello(socket, now);
 
                 for (Map.Entry<String, UsernameReservation> entry : reservedUsernames.entrySet())
                 {
@@ -837,6 +1182,15 @@ public class WitcherServer
 
                     for (Map.Entry<String, List<String>> coop : session.coopFields.entrySet())
                     {
+                        // a channel the player stopped sending (it was a member and now leads, or the other way round)
+                        // is dropped instead of being repeated for the rest of the session
+                        Long received = session.coopReceivedAt.get(coop.getKey());
+                        if (received == null || System.nanoTime() - received > COOP_STALE_NANOS)
+                        {
+                            removeCoopChannel(session, coop.getKey());
+                            continue;
+                        }
+
                         // repeated (for lost packets) only if nothing newer went out on arrival lately
                         Long forwarded = session.coopForwardedAt.get(coop.getKey());
                         if (forwarded != null && System.nanoTime() - forwarded < COOP_REPEAT_NANOS)
